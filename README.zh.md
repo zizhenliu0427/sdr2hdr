@@ -2,7 +2,7 @@
 
 > **语言 / Language**: **中文** · [English](README.md)
 
-基于 **英伟达 RTX Video SDK** 的单命令小工具，调用 SDK 的两个 AI 功能，RTX HDR (**TrueHDR**) 和 RTX VSR：
+基于 英伟达 RTX Video SDK 的 AI 视频增强小工具，支持 RTX HDR（SDR 转 HDR）和 RTX VSR（超分辨率）。与浏览器或播放器中的实时滤镜不同，sdr2hdr 会处理并将增强后的视频导出，不受原本只能实时处理播放的限制。
 
 
 | 模式          | 功能                                | 色域           | 分辨率        |

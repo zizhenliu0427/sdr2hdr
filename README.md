@@ -2,7 +2,7 @@
 
 > **Language / 语言**: **English** · [中文](README.zh.md)
 
-A single-command utility built on the **NVIDIA RTX Video SDK** that drives the SDK's two AI features — RTX HDR (**TrueHDR**) and RTX VSR:
+A command-line tool that applies NVIDIA RTX Video AI — RTX HDR (TrueHDR) and RTX VSR super-resolution — to videos and saves the processed result to a file. Unlike real-time playback filters (e.g. in Chrome or PotPlayer), sdr2hdr enables offline processing so you can keep the enhanced output.
 
 
 | Mode          | Purpose                                     | Colour space  | Resolution            |
