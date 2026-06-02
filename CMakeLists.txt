@@ -78,6 +78,7 @@ set(NVCODEC_WRAP_SRC
 set(RTX_API_DIR "${RTX_SDK_ROOT}/samples/RTX_Video_API")
 
 add_executable(sdr2hdr
+    app.rc
     src/main.cpp
     src/rtx_converter.cpp
     src/ffmpeg_process.cpp
