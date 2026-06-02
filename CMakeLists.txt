@@ -49,11 +49,20 @@ find_package(CUDAToolkit REQUIRED)
 # we don't need a pre-built SDK static lib. Layout under vendor mirrors the
 # upstream SDK so the sample sources' relative includes still resolve.
 # ---------------------------------------------------------------------------
-set(NVCODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvcodec")
+if(DEFINED ENV{NV_VIDEO_CODEC_SDK})
+    set(NVCODEC_ROOT "$ENV{NV_VIDEO_CODEC_SDK}")
+else()
+    set(NVCODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvcodec")
+endif()
+
+message(STATUS "Video Codec SDK root: ${NVCODEC_ROOT}")
+
 if(NOT EXISTS "${NVCODEC_ROOT}/Interface/nvcuvid.h")
     message(FATAL_ERROR
-        "Missing vendored Video Codec SDK at ${NVCODEC_ROOT}. "
-        "Download Video_Codec_SDK from NVIDIA and re-run the setup step.")
+        "Could not locate the Video Codec SDK at ${NVCODEC_ROOT}. "
+        "Set the NV_VIDEO_CODEC_SDK environment variable to the SDK directory "
+        "(the folder containing Interface/, Lib/, Samples/), "
+        "or place it at vendor/nvcodec/.")
 endif()
 
 set(NVCODEC_SAMPLES   "${NVCODEC_ROOT}/Samples")
@@ -94,7 +103,7 @@ target_include_directories(sdr2hdr PRIVATE
 
 target_link_directories(sdr2hdr PRIVATE
     "${RTX_SDK_ROOT}/lib/Windows/x64"
-    "${NVCODEC_ROOT}/Lib/x64"
+    "${NVCODEC_ROOT}/Lib/win/x64"
 )
 
 target_link_libraries(sdr2hdr PRIVATE

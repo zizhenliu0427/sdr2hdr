@@ -1679,8 +1679,16 @@ int main(int argc, char** argv)
     // THEN make sure the external runtime dependencies are in place before we
     // touch ffprobe (the wizard probes inputs) or the RTX SDK. ffmpeg/ffprobe
     // can be fetched on demand; the NVIDIA NGX DLLs can only be reported missing.
-    sdr2hdr::deps::ensureFfmpeg(g_interactiveLaunch);
-    sdr2hdr::deps::checkNgxDlls();
+    if (!sdr2hdr::deps::ensureFfmpeg(g_interactiveLaunch))
+    {
+        if (g_interactiveLaunch) pressEnterToContinue();
+        return 1;
+    }
+    if (!sdr2hdr::deps::checkNgxDlls())
+    {
+        if (g_interactiveLaunch) pressEnterToContinue();
+        return 1;
+    }
 
     std::vector<std::string> inputs;
 

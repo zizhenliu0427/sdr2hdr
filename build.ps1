@@ -1,4 +1,4 @@
-<#
+﻿<#
     One-click build script for the sdr2hdr tool.
 
     Default generator: Ninja (works around VS 2026 not yet having CUDA 12.x
@@ -20,23 +20,89 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir  = Join-Path $ScriptDir "build"
 
+# Detect system language (Chinese or English)
+$isChinese = (Get-Culture).Name -match "zh|CN|TW|HK"
+
 if ($Clean -and (Test-Path $BuildDir)) {
     Write-Host "Removing $BuildDir..." -ForegroundColor Yellow
     Remove-Item -Recurse -Force $BuildDir
 }
 
-# 1. Resolve SDK root ---------------------------------------------------------
-if (-not $env:NV_RTX_VIDEO_SDK) {
-    $SdkRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
-    Write-Host "NV_RTX_VIDEO_SDK not set - using auto-detected $SdkRoot" -ForegroundColor Yellow
-    $env:NV_RTX_VIDEO_SDK = $SdkRoot
-} else {
-    Write-Host "Using NV_RTX_VIDEO_SDK = $env:NV_RTX_VIDEO_SDK"
-}
+# 1. Resolve SDK roots --------------------------------------------------------
 
-if (-not (Test-Path (Join-Path $env:NV_RTX_VIDEO_SDK "include\nvsdk_ngx.h"))) {
-    throw "Invalid NV_RTX_VIDEO_SDK '$env:NV_RTX_VIDEO_SDK' - include\nvsdk_ngx.h missing."
+# 1a. RTX Video SDK
+while ($true) {
+    if (-not $env:NV_RTX_VIDEO_SDK) {
+        if ($isChinese) {
+            Write-Host "未设置 NV_RTX_VIDEO_SDK 环境变量。" -ForegroundColor Yellow
+            Write-Host "    请从以下地址下载 SDK:" -ForegroundColor Yellow
+            Write-Host "    https://developer.nvidia.com/rtx-video-sdk" -ForegroundColor Cyan
+            $input = Read-Host "如果已完成下载，请输入 RTX Video SDK 路径 (例如 D:\RTX_Video_SDK_v1.1.0)"
+        } else {
+            Write-Host "NV_RTX_VIDEO_SDK not set." -ForegroundColor Yellow
+            Write-Host "    Please download the SDK from:" -ForegroundColor Yellow
+            Write-Host "    https://developer.nvidia.com/rtx-video-sdk" -ForegroundColor Cyan
+            $input = Read-Host "If already downloaded, enter RTX Video SDK path (e.g. D:\RTX_Video_SDK_v1.1.0)"
+        }
+        $env:NV_RTX_VIDEO_SDK = $input.Trim('"')
+    }
+
+    if (Test-Path (Join-Path $env:NV_RTX_VIDEO_SDK "include\nvsdk_ngx.h")) {
+        break
+    }
+
+    Write-Host ""
+    if ($isChinese) {
+        Write-Host "[!] RTX Video SDK 路径无效: $env:NV_RTX_VIDEO_SDK" -ForegroundColor Red
+        Write-Host "    缺少 include\nvsdk_ngx.h 文件，请检查路径是否正确。" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] Invalid RTX Video SDK path: $env:NV_RTX_VIDEO_SDK" -ForegroundColor Red
+        Write-Host "    Missing include\nvsdk_ngx.h file, please check the path." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    $env:NV_RTX_VIDEO_SDK = $null
 }
+Write-Host "RTX Video SDK: $env:NV_RTX_VIDEO_SDK" -ForegroundColor Green
+
+# 1b. Video Codec SDK
+while ($true) {
+    if (-not $env:NV_VIDEO_CODEC_SDK) {
+        $defaultNvcodec = Join-Path $ScriptDir "vendor\nvcodec"
+        if (Test-Path (Join-Path $defaultNvcodec "Interface\nvcuvid.h")) {
+            $env:NV_VIDEO_CODEC_SDK = $defaultNvcodec
+            Write-Host "Video Codec SDK: $defaultNvcodec (auto-detected)" -ForegroundColor Green
+            break
+        }
+        if ($isChinese) {
+            Write-Host "未设置 NV_VIDEO_CODEC_SDK 环境变量。" -ForegroundColor Yellow
+            Write-Host "    请从以下地址下载 SDK:" -ForegroundColor Yellow
+            Write-Host "    https://developer.nvidia.com/video-codec-sdk" -ForegroundColor Cyan
+            $input = Read-Host "如果已完成下载，请输入 Video Codec SDK 路径 (例如 D:\Video_Codec_SDK_13.0)"
+        } else {
+            Write-Host "NV_VIDEO_CODEC_SDK not set." -ForegroundColor Yellow
+            Write-Host "    Please download the SDK from:" -ForegroundColor Yellow
+            Write-Host "    https://developer.nvidia.com/video-codec-sdk" -ForegroundColor Cyan
+            $input = Read-Host "If already downloaded, enter Video Codec SDK path (e.g. D:\Video_Codec_SDK_13.0)"
+        }
+        $env:NV_VIDEO_CODEC_SDK = $input.Trim('"')
+    }
+
+    if (Test-Path (Join-Path $env:NV_VIDEO_CODEC_SDK "Interface\nvcuvid.h")) {
+        break
+    }
+
+    Write-Host ""
+    if ($isChinese) {
+        Write-Host "[!] Video Codec SDK 路径无效: $env:NV_VIDEO_CODEC_SDK" -ForegroundColor Red
+        Write-Host "    缺少 Interface\nvcuvid.h 文件，请检查路径是否正确。" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] Invalid Video Codec SDK path: $env:NV_VIDEO_CODEC_SDK" -ForegroundColor Red
+        Write-Host "    Missing Interface\nvcuvid.h file, please check the path." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    $env:NV_VIDEO_CODEC_SDK = $null
+}
+Write-Host "Video Codec SDK: $env:NV_VIDEO_CODEC_SDK" -ForegroundColor Green
 
 # 2. Locate toolchain pieces --------------------------------------------------
 # 2a. vcvars64.bat -- try vswhere first, then common paths.
@@ -60,7 +126,17 @@ if (-not $VcVars) {
     }
 }
 if (-not $VcVars) {
-    throw "vcvars64.bat not found. Install Visual Studio Build Tools with the 'Desktop development with C++' workload."
+    Write-Host ""
+    if ($isChinese) {
+        Write-Host "[!] 未找到 Visual Studio Build Tools。" -ForegroundColor Red
+        Write-Host "    请安装 Visual Studio Build Tools，并勾选「使用 C++ 的桌面开发」工作负载。" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] Visual Studio Build Tools not found." -ForegroundColor Red
+        Write-Host "    Please install Visual Studio Build Tools with the 'Desktop development with C++' workload." -ForegroundColor Yellow
+    }
+    Write-Host "    Download: https://visualstudio.microsoft.com/visual-cpp-build-tools/" -ForegroundColor Cyan
+    Write-Host ""
+    throw "vcvars64.bat not found."
 }
 Write-Host "vcvars64: $VcVars"
 
@@ -76,7 +152,19 @@ if (-not $Ninja) {
                               -ErrorAction SilentlyContinue | Select-Object -First 1
     }
     if (-not $hits) {
-        throw "ninja.exe not found. Install it (scoop/choco) or the CMake component of Visual Studio."
+        Write-Host ""
+        if ($isChinese) {
+            Write-Host "[!] 未找到 Ninja。" -ForegroundColor Red
+            Write-Host "    通过 scoop 安装: scoop install ninja" -ForegroundColor Yellow
+            Write-Host "    或在 Visual Studio Installer 中安装「CMake」组件。" -ForegroundColor Yellow
+        } else {
+            Write-Host "[!] Ninja not found." -ForegroundColor Red
+            Write-Host "    Install via scoop: scoop install ninja" -ForegroundColor Yellow
+            Write-Host "    Or install the 'CMake' component in Visual Studio Installer." -ForegroundColor Yellow
+        }
+        Write-Host "    Download: https://ninja-build.org/" -ForegroundColor Cyan
+        Write-Host ""
+        throw "ninja.exe not found."
     }
     $NinjaPath = $hits.FullName
 } else {
@@ -100,7 +188,17 @@ if (-not $nvcc) {
 
 # 3. Make sure cmake is on PATH ----------------------------------------------
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    throw "cmake.exe not found on PATH. Install CMake >= 3.18 and re-run."
+    Write-Host ""
+    if ($isChinese) {
+        Write-Host "[!] PATH 中未找到 CMake。" -ForegroundColor Red
+        Write-Host "    请安装 CMake >= 3.18 并添加到 PATH。" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] CMake not found on PATH." -ForegroundColor Red
+        Write-Host "    Install CMake >= 3.18 and add it to PATH." -ForegroundColor Yellow
+    }
+    Write-Host "    Download: https://cmake.org/download/" -ForegroundColor Cyan
+    Write-Host ""
+    throw "cmake.exe not found on PATH."
 }
 
 # 4. Write a temporary batch file that: vcvars64 + cmake configure + cmake build
