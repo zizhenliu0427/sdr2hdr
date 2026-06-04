@@ -26,7 +26,7 @@ Requirements: an **NVIDIA RTX GPU** + a recent driver (**≥ r570.20**). Nothing
 
 > **What's in the archive.** A ready-to-run release bundles `ffmpeg.exe` / `ffprobe.exe` (third-party, LGPL/GPL) and NVIDIA's `nvngx_truehdr.dll` / `nvngx_vsr.dll` model files so the tool works out of the box.
 >
-> **Licensing note.** Those bundled files are third-party redistributables: the NVIDIA NGX DLLs are governed by the [RTX Video SDK license](https://developer.nvidia.com/rtx-video-sdk) (commercial redistribution needs an NVIDIA Application ID) and ffmpeg by LGPL/GPL.
+> **Licensing note.** Those bundled files are third-party redistributables: the NVIDIA NGX DLLs are governed by the [RTX Video SDK licence](https://developer.nvidia.com/rtx-video-sdk) (commercial redistribution needs an NVIDIA Application ID) and ffmpeg by LGPL/GPL.
 >
 > **If a release ships `sdr2hdr.exe` only:**
 > - **ffmpeg / ffprobe** are fetched automatically on first run — if they aren't found next to the exe or on `PATH`, the tool downloads a prebuilt static ffmpeg (~90 MB, from gyan.dev) over HTTPS, **verifies the publisher's SHA-256**, and installs it into its own folder. This happens once. Disable it with the env var `SDR2HDR_NO_AUTODOWNLOAD` (then install ffmpeg yourself).
@@ -140,7 +140,7 @@ Precedence: `--lang` > `SDR2HDR_LANG` env var > OS UI language > English fallbac
 
 ## Getting the dependencies (build from source)
 
-This repository contains **only the source code**. The third-party NVIDIA SDKs and ffmpeg are **not** redistributed here (license + size reasons), so you must obtain them yourself — all are free downloads:
+This repository contains **only the source code**. The third-party NVIDIA SDKs and ffmpeg are **not** redistributed here (licence + size reasons), so you must obtain them yourself — all are free downloads:
 
 1. **NVIDIA RTX Video SDK** — download from <https://developer.nvidia.com/rtx-video-sdk> (free NVIDIA developer account). It provides `include/`, `lib/Windows/x64/`, and `bin/Windows/x64/rel/nvngx_truehdr.dll` + `nvngx_vsr.dll`. Then either:
    - place this tool inside the SDK tree at `<SDK>/tools/sdr2hdr/` (the default layout the build infers automatically), **or**
@@ -399,6 +399,82 @@ All the recipient needs is **an NVIDIA RTX GPU + a recent driver** — no ffmpeg
 | `target height <= input height` warning with `--4k` / `--8k`                   | The input is already at or above the target. VSR is an upscaler — same-size or down-size makes no sense for it.  |
 | Watermark in the lower-left corner                                             | `dev`-flavour DLLs ship with a debug watermark. For commercial use, ask NVIDIA for the `rel` flavour and an Application ID. |
 
+
+## Roadmap
+
+### 🎯 v1.1 — WinUI 3 Graphical Interface
+
+A native Windows GUI built on WinUI 3 / Windows App SDK, replacing the console wizard for a more modern, visual workflow.
+
+- [ ] **Project scaffold** — WinUI 3 C++/WinRT project with WinAppSDK, integrating the existing `sdr2hdr` engine as a static library
+- [ ] **Main window** — drag-and-drop zone for video files, file picker button, recent-files list
+- [ ] **Mode selector** — toggle bar for HDR / VSR / VSR+HDR with live parameter panels (peak luminance slider, upscale target picker, codec/quality/preset selectors)
+- [ ] **Batch job queue** — data-grid view showing input file, status (pending / processing / done / failed), progress bar, ETA, fps
+- [ ] **Real-time preview** — side-by-side SDR vs HDR thumbnail (periodic frame grab from the SDK)
+- [ ] **Settings page** — default output directory, default codec/quality, ffmpeg/ngxs DLL path override, language (EN/ZH)
+- [ ] **About / updates** — version info, link to GitHub releases, update-check on startup
+
+### 🔧 v1.2 — Transcode Quality & Reliability
+
+- [ ] **Fix audio-video desync** — see [Known Audio-Video Sync Issues](#known-audio-video-sync-issues) below; root cause is frame-rate drift between re-encoded video and copied audio
+- [ ] **VFR (variable frame rate) support** — detect VFR sources and use `-vsync cfr` or per-frame PTS remapping in the muxer
+- [ ] **Subtitle track passthrough** — `-map 0:s?` so ASS/SRT/PGS subs survive the remux
+- [ ] **Chapter metadata copy** — `-map_metadata 0` to preserve chapters, titles, and tags
+- [ ] **HDR10 static metadata SEI** — inject SMPTE 2086 Mastering Display + CEA-861.3 MaxCLL/MaxFALL into NVENC output for strict HDR10 compliance
+
+### 🚀 v1.3 — Advanced Features
+
+- [ ] **Multi-GPU support** — select which GPU to use when multiple RTX cards are present
+- [ ] **Pause / resume / cancel** — interruptible processing with checkpoint state
+- [ ] **Output preview in player** — "Open in player" button after completion (launches mpv/VLC with HDR flags)
+- [ ] **Hardware requirements auto-check** — on startup, validate driver version, GPU capabilities, and SDK DLLs with actionable guidance
+- [ ] **Logging & diagnostics** — structured log file per run, exportable for bug reports
+
+### 💭 Future Ideas
+
+- [ ] **Windows on ARM native build** — ARM64 native compilation targeting NVIDIA RTX Spark ARM processors; includes NEON/SVE2 optimised CUDA kernels where applicable, ARM64EC compatibility layer for x64 dependencies (ffmpeg, NVENC SDK), and native WinUI 3 ARM64 GUI
+- [ ] Linux support (CUDA + RTX Video SDK via Wine/WSL2 or native port)
+- [ ] macOS support (Metal-based HDR pipeline, no RTX SDK dependency)
+- [ ] Plugin system for custom post-processing filters (denoise, sharpen, etc.)
+- [ ] Distributed processing across multiple machines
+
+---
+
+## Known Audio-Video Sync Issues
+
+The output video may have **audio-video desync** (audio drifts ahead or behind the video). This is a known issue with two root causes:
+
+### Root Cause 1: Frame-rate mismatch in the GPU-only pipeline
+
+In the GPU-only path, NVENC encodes at a fixed frame rate derived from the source's `r_frame_rate` (e.g. `24000/1001` for 23.976 fps). The muxer stamps timestamps using `-framerate num/den`. However:
+
+- **VFR (variable frame rate) sources** — screen recordings, phone videos, and OBS captures often use VFR. The source's `r_frame_rate` is a *nominal* rate (e.g. 30/1), but actual frame durations vary. The muxer assumes CFR (constant frame rate), so audio and video gradually drift apart over the video's duration.
+- **`avg_frame_rate` vs `r_frame_rate` rounding** — `ffprobe` reports `avg_frame_rate = 119997/1000` (from frame_count/duration) while `r_frame_rate = 120/1`. Using the wrong one introduces ~25 ppm drift, which accumulates to ~1 second desync over an 11-hour video.
+
+### Root Cause 2: Re-encode timing vs audio copy
+
+The audio is copied directly from the source (`-c:a copy`) with its original timestamps. The video is re-encoded with new timestamps from NVENC. If NVENC drops or duplicates frames (e.g. due to GPU load, thermal throttling, or pipeline back-pressure), the video's frame count diverges from the source, and the audio runs on the original timeline while video runs on the new one.
+
+### Planned Fix
+
+The v1.2 fix will:
+1. **Extract per-frame PTS from the source** using `ffprobe -show_frames` or by parsing the container's timing metadata
+2. **Inject matching PTS into the NVENC output** before passing to the muxer, so video timestamps stay synchronised with the original audio
+3. **Add `-async 1`** to the muxer as a safety net for minor frame-count mismatches
+4. **Detect VFR sources** and either convert to CFR at the muxer level or warn the user
+
+### Workaround (current)
+
+If you experience desync, try:
+```powershell
+# Force CFR conversion in the demuxer (helps with VFR sources)
+.\sdr2hdr.exe in.mp4 out.mp4 --hdr --legacy
+
+# Or re-sync audio after processing
+ffmpeg -i out.mp4 -i in.mp4 -map 0:v -map 1:a -c copy -shortest out_synced.mp4
+```
+
+---
 
 ## Known limitations
 
