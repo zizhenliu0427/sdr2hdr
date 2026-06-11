@@ -1,0 +1,5 @@
+// App icon for the merged GUI/CLI binary. Reuses the same app.ico as the
+// console build (repo root). 101 is loaded explicitly in MainWindow's ctor and
+// is also the lowest-numbered icon, so Explorer / the taskbar pick it up.
+#define IDI_APPICON 101
+IDI_APPICON ICON "..\\app.ico"

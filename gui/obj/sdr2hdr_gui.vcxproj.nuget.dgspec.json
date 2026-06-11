@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\sdr2hdr_gui.vcxproj": {}
+  },
+  "projects": {
+    "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\sdr2hdr_gui.vcxproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\sdr2hdr_gui.vcxproj",
+        "projectName": "sdr2hdr_gui",
+        "projectPath": "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\sdr2hdr_gui.vcxproj",
+        "packagesPath": "C:\\Users\\lzz28\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\obj\\",
+        "projectStyle": "PackageReference",
+        "skipContentFileWrite": true,
+        "UsingMicrosoftNETSdk": false,
+        "configFilePaths": [
+          "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\nuget.config"
+        ],
+        "originalTargetFrameworks": [
+          "native"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "native": {
+            "framework": "native",
+            "projectReferences": {}
+          }
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "native": {
+          "framework": "native",
+          "dependencies": {
+            "Microsoft.Windows.CppWinRT": {
+              "target": "Package",
+              "version": "[2.0.240405.15, )"
+            },
+            "Microsoft.Windows.SDK.BuildTools": {
+              "target": "Package",
+              "version": "[10.0.26100.1742, )"
+            },
+            "Microsoft.WindowsAppSDK": {
+              "target": "Package",
+              "version": "[1.7.260224002, )"
+            }
+          }
+        }
+      },
+      "runtimes": {
+        "win": {
+          "#import": []
+        },
+        "win-arm64": {
+          "#import": []
+        },
+        "win-x64": {
+          "#import": []
+        },
+        "win-x86": {
+          "#import": []
+        }
+      }
+    }
+  }
+}

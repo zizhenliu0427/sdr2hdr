@@ -2,6 +2,8 @@
 #include "win32_utils.h"
 
 #include <cstdio>
+#include <cstring>
+#include <share.h>
 #include <sstream>
 #include <vector>
 
@@ -19,12 +21,11 @@ using sdr2hdr::win32::encoderHasOption;
 
 namespace {
 
-// ffprobe reports codec_name; map to the shortcut ffmpeg -f /-bsf uses.
 struct CodecInfo
 {
-    const char* canonical;      // "h264" | "hevc" | "av1" | "vp9" | ...
-    const char* bsfName;        // bitstream filter, or nullptr for none
-    const char* muxFmt;         // value passed to ffmpeg -f (out = same as demux)
+    const char* canonical;
+    const char* bsfName;
+    const char* muxFmt;
 };
 
 CodecInfo classifyCodec(const std::string& codec)
@@ -32,13 +33,12 @@ CodecInfo classifyCodec(const std::string& codec)
     CodecInfo c{"", nullptr, nullptr};
     if (codec == "h264" || codec == "avc")        { c.canonical = "h264"; c.bsfName = "h264_mp4toannexb"; c.muxFmt = "h264"; }
     else if (codec == "hevc" || codec == "h265")  { c.canonical = "hevc"; c.bsfName = "hevc_mp4toannexb"; c.muxFmt = "hevc"; }
-    else if (codec == "av1")                       { c.canonical = "av1";  c.bsfName = nullptr;            c.muxFmt = "obu";  }
+    else if (codec == "av1")                       { c.canonical = "av1";  c.bsfName = nullptr;            c.muxFmt = "ivf";  }
     else if (codec == "vp9")                       { c.canonical = "vp9";  c.bsfName = nullptr;            c.muxFmt = "ivf";  }
     else if (codec == "vp8")                       { c.canonical = "vp8";  c.bsfName = nullptr;            c.muxFmt = "ivf";  }
     return c;
 }
 
-// Map container from output filename.
 enum class Container { Mp4Like, Matroska, Ts, Avi, Webm, Unknown };
 
 Container detectContainer(const std::string& path)
@@ -68,7 +68,8 @@ BitstreamDemuxer::~BitstreamDemuxer() { finish(); }
 
 bool BitstreamDemuxer::start(const std::string& input,
                              const std::string& codecName,
-                             bool verbose)
+                             bool verbose,
+                             const std::string& tsCapturePath)
 {
     const CodecInfo info = classifyCodec(codecName);
     if (!info.muxFmt)
@@ -87,11 +88,8 @@ bool BitstreamDemuxer::start(const std::string& input,
 
     std::ostringstream cmd;
     cmd << toolPath("ffmpeg.exe")
-        << " -nostdin -loglevel " << (verbose ? "info" : "error") << " ";
+        << " -nostdin -y -loglevel " << (verbose ? "info" : "error") << " ";
 
-    // Demux only; don't decode. Use -c:v copy so the bitstream flows through
-    // untouched. For MP4-stored H.264/HEVC we must strip the avcC/hvcC length
-    // prefixes and insert Annex-B start codes via the bitstream filter.
     cmd << "-i " << quote(input)
         << " -map 0:v:0"
         << " -c:v copy";
@@ -99,6 +97,12 @@ bool BitstreamDemuxer::start(const std::string& input,
         cmd << " -bsf:v " << info.bsfName;
     cmd << " -f " << info.muxFmt
         << " pipe:1";
+
+    // Optional second output: exact per-packet pts (framecrc format includes
+    // a "#tb 0: num/den" header and "stream, dts, pts, ..." lines). Costs no
+    // extra read of the source -- the packets are already in memory.
+    if (!tsCapturePath.empty())
+        cmd << " -map 0:v:0 -c:v copy -f framecrc " << quote(tsCapturePath);
 
     PROCESS_INFORMATION pi{};
     if (!launch(cmd.str(), nullptr, pOut.writeEnd, hStderr, pi))
@@ -149,21 +153,47 @@ void BitstreamDemuxer::dumpStderrTail(const char* label)
 
 BitstreamMuxer::~BitstreamMuxer() { finish(); }
 
+bool BitstreamMuxer::writeSink(const void* data, size_t bytes)
+{
+    if (m_rawFile)
+        return std::fwrite(data, 1, bytes, m_rawFile) == bytes;
+    if (m_hStdinWrite)
+        return writeAll(static_cast<HANDLE>(m_hStdinWrite), data, bytes);
+    return false;
+}
+
 bool BitstreamMuxer::start(const std::string& sourceForAudio,
                            const std::string& output,
                            const MuxerOptions& opts,
                            bool verbose)
 {
-    PipePair pIn;
-    if (!makePipe(pIn, /*childReads=*/true)) return false;
-
     const CodecInfo info = classifyCodec(opts.codec);
     if (!info.muxFmt)
     {
         fprintf(stderr, "BitstreamMuxer: unsupported codec '%s'.\n", opts.codec.c_str());
-        CloseHandle(pIn.readEnd); CloseHandle(pIn.writeEnd);
         return false;
     }
+
+    m_rawFileMode = !opts.rawOutputPath.empty();
+    if (m_rawFileMode)
+    {
+        m_rawFilePath = opts.rawOutputPath;
+        m_rawFile = _fsopen(m_rawFilePath.c_str(), "wb", _SH_DENYNO);
+        if (!m_rawFile)
+        {
+            fprintf(stderr, "BitstreamMuxer: cannot open raw output '%s'.\n",
+                    m_rawFilePath.c_str());
+            return false;
+        }
+        (void)sourceForAudio;
+        (void)output;
+        (void)verbose;
+        return true;
+    }
+
+    PipePair pIn;
+    if (!makePipe(pIn, /*childReads=*/true)) return false;
+
     const Container cont = detectContainer(output);
     if (cont == Container::Webm && opts.codec != "av1")
     {
@@ -176,66 +206,38 @@ bool BitstreamMuxer::start(const std::string& sourceForAudio,
     cmd << toolPath("ffmpeg.exe")
         << " -nostdin -loglevel " << (verbose ? "info" : "error") << " -y ";
 
-    // --- Input #0 : raw bitstream on pipe:0 ------------------------------
     cmd << "-f " << info.muxFmt;
     if (opts.fpsNum && opts.fpsDen)
-    {
-        // Exact rational matches the VUI timing NVENC baked into the stream.
         cmd << " -framerate " << opts.fpsNum << "/" << opts.fpsDen;
-    }
     else
-    {
         cmd << " -framerate " << opts.fps;
-    }
-
-    // Mux-time colour/trc tagging for the video stream. Applies to container
-    // and (for MKV) flows into the MKV colour elements.
     if (opts.hdr10)
-    {
         cmd << " -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc";
-    }
     else
-    {
         cmd << " -color_primaries bt709  -color_trc bt709     -colorspace bt709";
-    }
     cmd << " -i pipe:0";
 
-    // --- Input #1 : source file for audio --------------------------------
     if (opts.copyAudio && !sourceForAudio.empty())
     {
         cmd << " -i " << quote(sourceForAudio)
-            << " -map 0:v:0 -map 1:a? -c:a copy";
+            << " -map 0:v:0 -map 1:a:0 -c:a copy";
     }
     else
     {
         cmd << " -map 0:v:0";
     }
 
-    // --- Pass-through video copy -----------------------------------------
     cmd << " -c:v copy";
-
-    // NOTE on HDR10 static metadata:
-    //   `-master_display` / `-max_cll` are libx265 *encoder-private* options,
-    //   not top-level ffmpeg flags. They only work when actually re-encoding
-    //   through libx265, not with `-c:v copy`. Passing them here makes newer
-    //   ffmpeg builds abort with `Unrecognized option 'master_display'`.
-    //
-    //   For HDR10 playback, the VUI baked into the HEVC bitstream by NVENC
-    //   upstream (colourPrimaries=9 BT.2020, transferCharacteristics=16
-    //   ST.2084, colourMatrix=9 BT.2020 NCL) plus the stream-level
-    //   `-color_primaries/-color_trc/-colorspace` tags we already applied
-    //   above are sufficient for VLC/mpv/Windows/YouTube to treat the file
-    //   as HDR10. Mastering Display SEI (SMPTE 2086) and MaxCLL/MaxFALL SEI
-    //   (CEA-861.3) would be "nice to have" for strict HDR10 compliance,
-    //   but they require per-picture SEI payload insertion via NVENC's
-    //   NV_ENC_PIC_PARAMS_HEVC.pMasteringDisplay/pMaxCll. That's deferred.
     (void)opts.maxCll;
 
-    // Container-specific flags.
     if (cont == Container::Mp4Like)
     {
         if (opts.codec == "hevc") cmd << " -tag:v hvc1";
-        cmd << " -movflags +faststart";
+        // No +faststart: it rewrites the entire output a second time just to
+        // move moov to the front (20+ GB of extra I/O on a long 4K capture).
+        // Local players handle moov-at-end fine; it only matters for
+        // progressive HTTP streaming. It would also break the VFR re-timing
+        // pass, which requires moov to be the last box (mp4_retime.cpp).
     }
 
     cmd << " " << quote(output);
@@ -258,14 +260,22 @@ bool BitstreamMuxer::start(const std::string& sourceForAudio,
     return true;
 }
 
-bool BitstreamMuxer::writeChunk(const void* src, size_t bytes)
+bool BitstreamMuxer::writeChunk(const void* src, size_t bytes, size_t /*frameIndex*/)
 {
-    if (!m_hStdinWrite || !bytes) return true;
+    if (!bytes) return true;
+    if (m_rawFileMode)
+        return writeSink(src, bytes);
+    if (!m_hStdinWrite) return false;
     return writeAll(static_cast<HANDLE>(m_hStdinWrite), src, bytes);
 }
 
 void BitstreamMuxer::finish()
 {
+    if (m_rawFile)
+    {
+        std::fclose(m_rawFile);
+        m_rawFile = nullptr;
+    }
     if (m_hStdinWrite) { CloseHandle(static_cast<HANDLE>(m_hStdinWrite)); m_hStdinWrite = nullptr; }
     if (m_hProcess)
     {
@@ -278,9 +288,76 @@ void BitstreamMuxer::finish()
         DeleteFileW(toWide(m_stderrLog).c_str());
         m_stderrLog.clear();
     }
+    m_rawFileMode = false;
+    m_rawFilePath.clear();
 }
 
 void BitstreamMuxer::dumpStderrTail(const char* label)
 {
     dumpStderrLog(m_stderrLog, label);
+}
+
+// ===========================================================================
+// IvfStreamParser
+// ===========================================================================
+
+namespace {
+
+constexpr size_t kIvfFileHeaderSize  = 32;
+constexpr size_t kIvfFrameHeaderSize = 12;
+constexpr size_t kIvfMaxFrameBytes   = 64u << 20; // 64 MiB sanity cap
+
+} // namespace
+
+void IvfStreamParser::append(const uint8_t* data, size_t n)
+{
+    if (!data || !n) return;
+    m_buf.insert(m_buf.end(), data, data + n);
+}
+
+void IvfStreamParser::setEof()
+{
+    m_eof = true;
+}
+
+bool IvfStreamParser::nextFrame(std::vector<uint8_t>& payloadOut)
+{
+    payloadOut.clear();
+
+    if (!m_headerDone)
+    {
+        if (m_buf.size() < kIvfFileHeaderSize)
+            return false;
+        if (!(m_buf[0] == 'D' && m_buf[1] == 'K' && m_buf[2] == 'I' && m_buf[3] == 'F'))
+        {
+            fprintf(stderr, "IvfStreamParser: bad IVF magic (expected DKIF).\n");
+            return false;
+        }
+        m_buf.erase(m_buf.begin(), m_buf.begin() + static_cast<std::ptrdiff_t>(kIvfFileHeaderSize));
+        m_headerDone = true;
+    }
+
+    if (m_buf.size() < kIvfFrameHeaderSize)
+        return false;
+
+    const uint32_t frameSize =
+        static_cast<uint32_t>(m_buf[0]) |
+        (static_cast<uint32_t>(m_buf[1]) << 8) |
+        (static_cast<uint32_t>(m_buf[2]) << 16) |
+        (static_cast<uint32_t>(m_buf[3]) << 24);
+
+    if (frameSize == 0 || frameSize > kIvfMaxFrameBytes)
+    {
+        fprintf(stderr, "IvfStreamParser: invalid IVF frame size %u.\n", frameSize);
+        return false;
+    }
+
+    const size_t total = kIvfFrameHeaderSize + static_cast<size_t>(frameSize);
+    if (m_buf.size() < total)
+        return false;
+
+    payloadOut.assign(m_buf.begin() + kIvfFrameHeaderSize,
+                      m_buf.begin() + static_cast<std::ptrdiff_t>(total));
+    m_buf.erase(m_buf.begin(), m_buf.begin() + static_cast<std::ptrdiff_t>(total));
+    return true;
 }

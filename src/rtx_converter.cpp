@@ -69,7 +69,11 @@ bool RtxConverter::initialize(Mode mode,
     if (!checkCu(cuDeviceGet(&dev, gpuIndex), "cuDeviceGet")) return false;
 
     CUcontext ctx = nullptr;
+#if CUDA_VERSION >= 13000
+    if (!checkCu(cuCtxCreate(&ctx, nullptr, 0, dev), "cuCtxCreate")) return false;
+#else
     if (!checkCu(cuCtxCreate(&ctx, 0, dev), "cuCtxCreate")) return false;
+#endif
     m_cuContext   = ctx;
     m_ownsContext = true;
     m_cuStream    = nullptr;

@@ -18,12 +18,30 @@
 #include "gpu_pipeline.h"
 #include "deps.h"
 #include "i18n.h"
+#include "engine.h"
+#include "path_utils.h"
 
+// Hybrid-graphics (iGPU + dGPU) machines: ask the drivers to bind this
+// process to the discrete GPU directly. Without it, NVIDIA's hybrid CUDA
+// shim (nvcudart_hybrid64.dll) interposes device enumeration for windowed
+// processes, and NGX's GetLUIDFromCudaDevice then smashes its own stack
+// inside NVSDK_NGX_CUDA_Init -> 0xC0000409 crash at conversion start.
+// Console processes are never routed through the shim, which is why the
+// CLI build never crashed. Standard exports, read straight from the exe's
+// export table by both vendors' drivers.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include <iostream>
@@ -45,6 +63,15 @@
 
 namespace fs = std::filesystem;
 
+using sdr2hdr::pathFromUtf8;
+using sdr2hdr::utf8FromPath;
+using sdr2hdr::extOf;
+using sdr2hdr::replaceExt;
+using sdr2hdr::isVideoExt;
+using sdr2hdr::parseSize;
+using sdr2hdr::autoSuffix;
+using sdr2hdr::resolveOutputPath;
+
 namespace {
 using i18n::tr;
 using i18n::trs;
@@ -53,44 +80,28 @@ using i18n::trs;
 // Options: everything EXCEPT input/output paths (those are per-file Job data).
 // --------------------------------------------------------------------------
 
-struct Options
+using Options = sdr2hdr::ProcessOptions;
+
+// --cancel-event <name>: internal flag used by the GUI, which runs each
+// conversion in a worker process (crash isolation from the NVIDIA NGX/hybrid
+// -graphics bug -- see ngx_session.cpp). Signalling the named event cancels
+// the conversion cooperatively, so temp files and partial output are cleaned
+// up exactly like the in-process cancel path.
+std::atomic<bool> g_cliCancel{false};
+std::string       g_cancelEventName;
+
+void startCancelEventWatcher()
 {
-    RtxConverter::Mode mode = RtxConverter::Mode::Hdr;
-    bool        modeSet      = false;   // did the user explicitly pick a mode?
-
-    // VSR sizing (three mutually exclusive mechanisms)
-    uint32_t    vsrQuality   = 4;   // 1..4 (default: max quality)
-    double      scale        = 2.0;
-    uint32_t    outW         = 0;
-    uint32_t    outH         = 0;
-    uint32_t    targetHeight = 0;   // 0 = no preset; 1080 / 2160 / 4320 / ...
-    bool        scaleSet      = false;
-    bool        outputSizeSet = false;
-
-    // TrueHDR artistic + HDR10 metadata
-    uint32_t    contrast   = 100;
-    uint32_t    saturation = 100;
-    uint32_t    middleGray = 50;
-    uint32_t    maxLum     = 1000;
-
-    // Encoder pipeline
-    std::string backend  = "nvenc";     // "nvenc" | "software"
-    std::string codec    = "hevc";      // "hevc" | "h264" | "av1"
-    int         quality  = -1;          // -1 = pick backend default
-    // When true, ignore `quality` and re-derive CQP per file from probed
-    // source bitrate (cf. recommendQuality()). Enabled by `--quality auto`
-    // or the wizard's "Match source" tier. Default off so existing CLI
-    // invocations stay deterministic.
-    bool        qualityAuto = false;
-    std::string preset   = "";
-    bool        copyAudio = true;
-    bool        hwDecode  = true;
-    bool        verbose   = false;
-
-    // GPU-only pipeline (NVDEC + CUDA + NVENC in-process, bitstream-only pipes
-    // to ffmpeg). Default ON; user can opt out with --legacy for diagnostics.
-    bool        gpuOnly   = true;
-};
+    if (g_cancelEventName.empty()) return;
+    std::wstring wname(g_cancelEventName.begin(), g_cancelEventName.end());
+    HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, wname.c_str());
+    if (!h) return;
+    std::thread([h]() {
+        WaitForSingleObject(h, INFINITE);
+        g_cliCancel.store(true);
+        CloseHandle(h);
+    }).detach();
+}
 
 // Global flag: was the exe launched in a way that warrants a pause-on-exit?
 bool g_interactiveLaunch = false;
@@ -102,160 +113,8 @@ bool g_interactiveLaunch = false;
 bool g_langExplicit = false;
 
 // --------------------------------------------------------------------------
-// Path / file utilities
+// Path / file utilities (see path_utils.h; pickers below still need wide helpers)
 // --------------------------------------------------------------------------
-
-// UTF-8 <-> wide conversion. The std::filesystem API on MSVC treats
-// std::string as the system ANSI code page (CP_ACP; e.g. CP936 / GBK on
-// Chinese Windows), NOT UTF-8. We keep all paths internally as UTF-8 (file
-// pickers return UTF-16 which we convert once), so every std::string -> fs::path
-// hop MUST go through wide chars or `fs::u8path`, otherwise paths containing
-// non-ASCII characters get silently mangled to CP_ACP garbage and any
-// downstream fs::create_directories / fs::exists / etc. on a network drive
-// can throw or hang for tens of seconds before the process dies.
-//
-// Symptom this caused: user picks a path with Chinese characters, wizard
-// freezes between step 4 (codec) and step 5 (output file), then the console
-// window closes with no error message, because the unhandled
-// filesystem_error propagated out of main() and the OS reaped the process.
-#ifdef _WIN32
-inline std::wstring utf8ToWideImpl(const std::string& s)
-{
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (len <= 0) return {};
-    std::wstring w(static_cast<size_t>(len - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), len);
-    return w;
-}
-inline std::string wideToUtf8Impl(const wchar_t* w)
-{
-    if (!w || !*w) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string s(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), len, nullptr, nullptr);
-    return s;
-}
-inline fs::path pathFromUtf8(const std::string& s) { return fs::path(utf8ToWideImpl(s)); }
-inline std::string utf8FromPath(const fs::path& p) { return wideToUtf8Impl(p.wstring().c_str()); }
-#else
-inline fs::path pathFromUtf8(const std::string& s) { return fs::path(s); }
-inline std::string utf8FromPath(const fs::path& p) { return p.string(); }
-#endif
-
-std::string extOf(const std::string& p)
-{
-    auto slash = p.find_last_of("\\/");
-    auto dot   = p.find_last_of('.');
-    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-        return {};
-    std::string e;
-    for (size_t i = dot + 1; i < p.size(); ++i)
-        e.push_back(static_cast<char>(::tolower(p[i])));
-    return e;
-}
-
-std::string replaceExt(const std::string& p, const std::string& newExt)
-{
-    auto slash = p.find_last_of("\\/");
-    auto dot   = p.find_last_of('.');
-    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-        return p + "." + newExt;
-    return p.substr(0, dot + 1) + newExt;
-}
-
-bool isVideoExt(const std::string& ext)
-{
-    static const char* known[] = {
-        "mp4","m4v","mov","qt","mkv","ts","m2ts","mts","avi","webm",
-        "wmv","flv","avchd","mpg","mpeg","vob","3gp","3g2"
-    };
-    for (auto* s : known)
-        if (ext == s) return true;
-    return false;
-}
-
-bool parseSize(const std::string& s, uint32_t& w, uint32_t& h)
-{
-    auto x = s.find('x');
-    if (x == std::string::npos) x = s.find('X');
-    if (x == std::string::npos) return false;
-    w = static_cast<uint32_t>(std::atoi(s.substr(0, x).c_str()));
-    h = static_cast<uint32_t>(std::atoi(s.substr(x + 1).c_str()));
-    return w > 0 && h > 0;
-}
-
-// Auto-derived suffix based on chosen options (e.g. "_hdr", "_4k", "_4k_hdr").
-std::string autoSuffix(const Options& opts)
-{
-    const bool hdr = (opts.mode == RtxConverter::Mode::Hdr ||
-                      opts.mode == RtxConverter::Mode::VsrHdr);
-    const bool vsr = (opts.mode == RtxConverter::Mode::Vsr ||
-                      opts.mode == RtxConverter::Mode::VsrHdr);
-
-    std::string s;
-    if (vsr)
-    {
-        if (opts.targetHeight)
-            s += "_" + std::to_string(opts.targetHeight) + "p";
-        else if (opts.outputSizeSet)
-            s += "_" + std::to_string(opts.outW) + "x" + std::to_string(opts.outH);
-        else
-        {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "_%gx", opts.scale);
-            s += buf;
-        }
-    }
-    if (hdr) s += "_hdr";
-    if (s.empty()) s = "_out";
-    return s;
-}
-
-// Resolve the final output path for a given input file.
-//   outTarget:    empty string, a file path, or a directory path (per outIsDir)
-//   outIsDir:     if true, outTarget is a directory; otherwise a full output file
-//   explicitOut:  if true, outTarget was explicitly set by user (-o or legacy pair)
-std::string resolveOutputPath(const std::string& input,
-                              const std::string& outTarget,
-                              bool outIsDir,
-                              bool explicitOut,
-                              const Options& opts)
-{
-    // Legacy: single explicit output file specified.
-    if (explicitOut && !outIsDir)
-    {
-        // Normalise extension to input's.
-        std::string inExt = extOf(input);
-        std::string outExt = extOf(outTarget);
-        if (!inExt.empty() && inExt != outExt)
-            return replaceExt(outTarget, inExt);
-        return outTarget;
-    }
-
-    // Auto: derive basename + suffix + ext from input.
-    // pathFromUtf8 is critical here -- `fs::path(std::string)` on MSVC decodes
-    // via CP_ACP, which silently mangles Chinese/Cyrillic/etc. paths.
-    fs::path inPath = pathFromUtf8(input);
-    std::string stem = utf8FromPath(inPath.stem());
-    std::string ext  = utf8FromPath(inPath.extension());    // includes the dot
-    std::string auto_name = stem + autoSuffix(opts) + ext;
-
-    fs::path outDir;
-    if (explicitOut && outIsDir)
-        outDir = pathFromUtf8(outTarget);
-    else
-        outDir = inPath.parent_path();
-
-    if (outDir.empty()) outDir = pathFromUtf8(".");
-
-    // Best-effort; ignore failure. Using the non-throwing overload so that
-    // a permissions / network blip doesn't kill the wizard before step 5.
-    std::error_code ec;
-    fs::create_directories(outDir, ec);
-    return utf8FromPath(outDir / pathFromUtf8(auto_name));
-}
 
 // --------------------------------------------------------------------------
 // Native Windows pickers (comdlg32 / shell32)
@@ -465,6 +324,10 @@ void printUsage(const char* exe)
         "  --preset P         Encoder preset (auto-mapped between encoders)\n"
         "  --no-hw-decode     Disable NVDEC decoding (legacy pipeline only)\n"
         "  --no-audio         Skip source audio copy\n"
+        "  --no-vfr-pts       Disable VFR timestamp passthrough; force CFR at the\n"
+        "                     average fps (mid-file A/V drift on VFR sources)\n"
+        "  --ngx-sessions N   Parallel RTX AI sessions, 1-4 (default 1; >1 currently\n"
+        "                     rejected by the NVIDIA driver, falls back to 1)\n"
         "  --gpu-only         Keep frames in VRAM end-to-end (default, fastest)\n"
         "  --legacy           Old pipeline: ffmpeg pixel pipes + host-pointer RTX\n"
         "  --verbose          Show ffmpeg stderr\n"
@@ -523,6 +386,10 @@ void printUsage(const char* exe)
         "  --preset P         编码预设 (跨编码器自动映射)\n"
         "  --no-hw-decode     关闭 NVDEC 硬解 (仅 legacy 管线有效)\n"
         "  --no-audio         不复制源音频\n"
+        "  --no-vfr-pts       关闭 VFR 时间戳透传，强制按平均帧率 CFR 打点\n"
+        "                     (VFR 源的视频中段可能音画漂移)\n"
+        "  --ngx-sessions N   并行 RTX AI 会话数 1-4 (默认 1；>1 目前会被\n"
+        "                     英伟达驱动拒绝并自动回退到 1)\n"
         "  --gpu-only         画面全程驻留显存 (默认，最快)\n"
         "  --legacy           旧管线：ffmpeg 像素管道 + 主机指针 RTX\n"
         "  --verbose          显示 ffmpeg 标准错误\n"
@@ -645,6 +512,19 @@ ParseResult parseArgs(int argc, char** argv,
         else if (a == "--preset")      { if (!nextS(opts.preset))     return ParseResult::Error; }
         else if (a == "--no-hw-decode"){ opts.hwDecode  = false; }
         else if (a == "--no-audio")    { opts.copyAudio = false; }
+        else if (a == "--no-vfr-pts")  { opts.vfrPts    = false; }
+        else if (a == "--cancel-event")
+        {
+            if (!nextS(g_cancelEventName)) return ParseResult::Error;
+        }
+        else if (a == "--ngx-sessions")
+        {
+            if (!nextI(opts.ngxSessions)) return ParseResult::Error;
+            if (opts.ngxSessions < 1 || opts.ngxSessions > 4) {
+                fprintf(stderr, "Invalid --ngx-sessions %d (want 1-4)\n", opts.ngxSessions);
+                return ParseResult::Error;
+            }
+        }
         else if (a == "--verbose")     { opts.verbose   = true;  }
         else if (a == "--gpu-only")    { opts.gpuOnly   = true;  }
         else if (a == "--legacy" || a == "--no-gpu-only")
@@ -1219,41 +1099,26 @@ bool runWizard(std::vector<std::string>& inputs,
 }
 
 // --------------------------------------------------------------------------
-// processOne: run the pipeline for a single (input, output) pair.
+// processOne: CLI wrapper around sdr2hdr::processFile (keeps console headers).
 // --------------------------------------------------------------------------
 
-int processOne(const std::string& inputIn, const std::string& outputIn, const Options& opts)
+int processOne(const std::string& input, const std::string& outputIn, const Options& opts)
 {
-    std::string input  = inputIn;
     std::string output = outputIn;
-
-    // Normalise output container to match input (unless user passed a dir-like
-    // explicit output path that already shares the extension).
     {
         std::string inExt  = extOf(input);
         std::string outExt = extOf(output);
         if (!inExt.empty() && inExt != outExt)
         {
-            std::string orig = output;
             output = replaceExt(output, inExt);
             printf("Note: output container normalised to match input (.%s -> .%s)\n",
                    outExt.c_str(), inExt.c_str());
         }
     }
-
-    // Codec/container compatibility fix-up.
-    //
-    // WebM mandates VP8 / VP9 / AV1; the ffmpeg muxer flat-out refuses any
-    // other video codec. Without this guard, a batch run of mixed inputs
-    // (.mkv + .webm) silently fails the webm item with "Failed to start
-    // BitstreamMuxer" because we faithfully preserved its .webm extension
-    // but the user picked HEVC. Auto-rewrite to .mp4 instead -- .mp4 happily
-    // carries HEVC / H.264 / AV1, so it's a safe universal landing zone.
     {
         std::string curExt = extOf(output);
         if (curExt == "webm" && opts.codec != "av1")
         {
-            std::string oldOut = output;
             output = replaceExt(output, "mp4");
             printf(tr("Note: .webm cannot carry %s; switching output container to .mp4\n"
                       "      (use --codec av1 to keep .webm)\n",
@@ -1269,55 +1134,33 @@ int processOne(const std::string& inputIn, const std::string& outputIn, const Op
         fprintf(stderr, "Failed to probe input video: %s\n", input.c_str());
         return 2;
     }
+    if (info.isVfr)
+    {
+        fprintf(stderr,
+                "Note: variable frame rate detected (nominal %.2f fps, "
+                "average %.2f fps). Using average for A/V sync.\n",
+                info.rFps, info.avgFps);
+    }
 
-    auto roundEven = [](double v) {
-        auto u = static_cast<uint32_t>(v + 0.5);
-        return u & ~1u;
-    };
-
-    uint32_t outW = info.width;
-    uint32_t outH = info.height;
+    uint32_t outW = info.width, outH = info.height;
     if (opts.mode == RtxConverter::Mode::Vsr || opts.mode == RtxConverter::Mode::VsrHdr)
     {
-        // Fallback order:
-        //   1. explicit --output-size WxH
-        //   2. --1080p / --4k / --8k preset
-        //   3. explicit --scale F (only when user set it)
-        //   4. implicit default: 4K / 2160p (upscaler target that matches
-        //      current mainstream displays -- RTX 40+ TrueHDR can do this in
-        //      real time, and users rarely run VSR to produce 2x of already-HD
-        //      content without wanting UHD).
-        if (opts.outputSizeSet)
-        {
-            outW = opts.outW;
-            outH = opts.outH;
-        }
+        if (opts.outputSizeSet) { outW = opts.outW; outH = opts.outH; }
         else if (opts.targetHeight)
         {
             outH = opts.targetHeight & ~1u;
-            outW = roundEven(info.width * static_cast<double>(opts.targetHeight)
-                                        / static_cast<double>(info.height));
-            if (opts.targetHeight <= info.height)
-                fprintf(stderr, "Warning: target height %u <= input height %u; "
-                                "VSR is an upscaler.\n",
-                        opts.targetHeight, info.height);
+            outW = static_cast<uint32_t>(info.width * static_cast<double>(opts.targetHeight)
+                                                   / static_cast<double>(info.height) + 0.5) & ~1u;
         }
         else if (opts.scaleSet)
         {
-            outW = roundEven(info.width  * opts.scale);
-            outH = roundEven(info.height * opts.scale);
+            outW = static_cast<uint32_t>(info.width  * opts.scale + 0.5) & ~1u;
+            outH = static_cast<uint32_t>(info.height * opts.scale + 0.5) & ~1u;
         }
         else
         {
-            const uint32_t defaultH = 2160;
-            outH = defaultH;
-            outW = roundEven(info.width * static_cast<double>(defaultH)
-                                        / static_cast<double>(info.height));
-            if (defaultH <= info.height)
-                fprintf(stderr, "Warning: input height %u already >= default 4K "
-                                "target; use --scale or --output-size to upscale "
-                                "further, or --1080p to downscale.\n",
-                        info.height);
+            outH = 2160;
+            outW = static_cast<uint32_t>(info.width * 2160.0 / info.height + 0.5) & ~1u;
         }
     }
 
@@ -1331,241 +1174,37 @@ int processOne(const std::string& inputIn, const std::string& outputIn, const Op
            modeName(opts.mode), output.c_str(), outW, outH,
            (opts.mode == RtxConverter::Mode::Vsr) ? "  (SDR)" : "  (HDR10)");
 
-    auto encoderLabel = [&]() -> const char* {
-        const bool hw = (opts.backend == "nvenc");
-        if (opts.codec == "h264") return hw ? "h264_nvenc (NVENC)"  : "libx264 (CPU)";
-        if (opts.codec == "av1")  return hw ? "av1_nvenc (NVENC)"   : "libsvtav1 (CPU)";
-        return                            hw ? "hevc_nvenc (NVENC)" : "libx265 (CPU)";
-    };
-    // Resolve the effective CQP for this file. Three layers:
-    //   1) explicit --quality N (or wizard "Custom"): use as-is.
-    //   2) --quality auto / wizard "Auto - match source": recompute per file
-    //      from the probed source bitrate, so a 140 Mbps DVR clip gets a
-    //      tighter q than a 6 Mbps streaming clip even in the same batch.
-    //   3) Neither: fall back to backend default (nvenc -> 19, sw -> 18).
-    const bool wantsHdrOutEff =
-        (opts.mode == RtxConverter::Mode::Hdr ||
-         opts.mode == RtxConverter::Mode::VsrHdr);
-    int effectiveQuality;
-    if (opts.qualityAuto && info.bitRateBps > 0)
+    auto r = sdr2hdr::processFile(input, output, opts, {}, &g_cliCancel);
+    if (!r.ok)
     {
-        effectiveQuality = recommendQuality(
-            info.bitRateBps, outW, outH, info.fps, wantsHdrOutEff, /*keepRatio=*/0.75);
-        double pred = predictBitrateMbps(
-            effectiveQuality, outW, outH, info.fps, wantsHdrOutEff);
-        printf("Quality auto: source %.0f Mbps -> q=%d (~%.0f Mbps target)\n",
-               info.bitRateBps / 1.0e6, effectiveQuality, pred);
-    }
-    else if (opts.quality >= 0)
-    {
-        effectiveQuality = opts.quality;
-    }
-    else
-    {
-        effectiveQuality = (opts.backend == "nvenc") ? 19 : 18;
-    }
-
-    // GPU-only bitstream pipe only works cleanly for H.264 / HEVC / AV1
-    // (Annex-B / OBU framing matches what cuvidParseVideoData expects).
-    // For VP9 / VP8 / older codecs the pipe currently emits container-wrapped
-    // packets (IVF) that NvDecoder mis-parses (you'll see absurd
-    // "Resolution: 21249x1" errors from cuvidCreateDecoder). Until the
-    // demuxer learns to strip IVF / produce raw super-frames, transparently
-    // fall back to the legacy ffmpeg pixel-pipe path for those inputs --
-    // ffmpeg's libvpx/dav1d decoders handle them just fine and the rest of
-    // the pipeline doesn't care.
-    bool useGpuOnly = opts.gpuOnly && opts.backend == "nvenc";
-    if (useGpuOnly &&
-        info.codecName != "h264" && info.codecName != "avc"  &&
-        info.codecName != "hevc" && info.codecName != "h265" &&
-        info.codecName != "av1")
-    {
-        printf(tr("Note: input codec '%s' not supported by GPU-only pipeline; "
-                  "falling back to legacy ffmpeg path for this file.\n",
-                  "提示: GPU-only 流水线不支持输入编码 '%s'，本文件回退到 legacy 路径。\n"),
-               info.codecName.empty() ? "?" : info.codecName.c_str());
-        useGpuOnly = false;
-    }
-
-    printf("Decode: %s   Encode: %s (%s q=%d)%s\n",
-           opts.hwDecode ? "NVDEC (-hwaccel cuda)" : "software",
-           encoderLabel(),
-           opts.preset.empty() ? (opts.backend == "nvenc" ? "p5" : "medium") : opts.preset.c_str(),
-           effectiveQuality,
-           useGpuOnly ? "   [GPU-only]" : "   [legacy pipeline]");
-
-    // ------------------------------------------------------------------
-    // GPU-only path: NVDEC + CUDA kernels + RTX SDK (deviceptr) + NVENC
-    // all in-process; only compressed bitstreams cross the pipe to ffmpeg.
-    // ------------------------------------------------------------------
-    if (useGpuOnly)
-    {
-        sdr2hdr::GpuPipelineOptions gopts;
-        gopts.mode        = opts.mode;
-        gopts.input       = info;
-        gopts.outWidth    = outW;
-        gopts.outHeight   = outH;
-        gopts.codec       = opts.codec;
-        gopts.rtx.contrast   = opts.contrast;
-        gopts.rtx.saturation = opts.saturation;
-        gopts.rtx.middleGray = opts.middleGray;
-        gopts.rtx.maxLum     = opts.maxLum;
-        gopts.rtx.vsrQuality = opts.vsrQuality;
-        gopts.maxLuminance = opts.maxLum;
-        gopts.copyAudio    = opts.copyAudio;
-        gopts.quality      = effectiveQuality;
-        gopts.preset       = opts.preset;
-        gopts.verbose      = opts.verbose;
-
-        auto r = sdr2hdr::runGpuOnly(input, output, gopts);
-        if (!r.ok)
-        {
-            fprintf(stderr, "GPU-only pipeline failed: %s\n",
-                    r.errorDetail.empty() ? "(see above)" : r.errorDetail.c_str());
+        fprintf(stderr, "%s\n",
+                r.errorDetail.empty() ? "Processing failed." : r.errorDetail.c_str());
+        if (r.exitCode == 6)
             fprintf(stderr, "Tip: retry with --legacy to bypass the in-process pipeline.\n");
-            return 6;
-        }
-        double fps = r.seconds > 0 ? r.framesIn / r.seconds : 0.0;
+        return r.exitCode ? r.exitCode : 1;
+    }
+
+    if (opts.gpuOnly && opts.backend == "nvenc")
+    {
+        double fps = r.seconds > 0 ? r.framesProcessed / r.seconds : 0.0;
         printf("Done. %llu frames in %.1f s (%.1f fps)  [GPU-only]\n",
-               static_cast<unsigned long long>(r.framesIn), r.seconds, fps);
-        return 0;
+               static_cast<unsigned long long>(r.framesProcessed), r.seconds, fps);
     }
-
-    RtxConverter converter;
-    if (!converter.initialize(opts.mode, info.width, info.height, outW, outH))
-    {
-        fprintf(stderr, "Failed to initialize RTX Video SDK.\n"
-                        "  Check: NVIDIA driver >= r570, RTX GPU, nvngx_*.dll next to exe.\n");
-        return 3;
-    }
-
-    FFmpegDecoder decoder;
-    if (!decoder.start(input, info.width, info.height, opts.hwDecode, opts.verbose))
-    {
-        fprintf(stderr, "Failed to spawn ffmpeg decoder.\n");
-        return 4;
-    }
-
-    EncoderOptions eo;
-    eo.width        = outW;
-    eo.height       = outH;
-    eo.fps          = info.fps;
-    eo.quality      = effectiveQuality;
-    eo.preset       = opts.preset;
-    eo.backend      = opts.backend;
-    eo.codec        = opts.codec;
-    eo.copyAudio    = opts.copyAudio;
-    eo.maxLuminance = opts.maxLum;
-    eo.hdrOutput    = converter.outputIsHdr();
-
-    FFmpegEncoder encoder;
-    if (!encoder.start(input, output, eo, opts.verbose))
-    {
-        fprintf(stderr, "Failed to spawn ffmpeg encoder.\n");
-        return 5;
-    }
-
-    std::vector<uint8_t> inFrame(converter.inputFrameBytes());
-    std::vector<uint8_t> outFrame(converter.outputFrameBytes());
-
-    RtxConverter::Params p{};
-    p.contrast   = opts.contrast;
-    p.saturation = opts.saturation;
-    p.middleGray = opts.middleGray;
-    p.maxLum     = opts.maxLum;
-    p.vsrQuality = opts.vsrQuality;
-
-    uint64_t frameIdx = 0;
-    auto tStart = std::chrono::steady_clock::now();
-    auto tLast  = tStart;
-
-    bool encoderDied = false;
-    bool decoderDied = false;
-    while (true)
-    {
-        if (!decoder.readFrame(inFrame.data(), inFrame.size()))
-        {
-            // EOF is normal; distinguish a premature death by checking if we
-            // read at least one frame AND the reported frame count is known.
-            if (frameIdx == 0) decoderDied = true;
-            break;
-        }
-        if (!converter.convertFrame(inFrame.data(), outFrame.data(), p))
-        {
-            fprintf(stderr, "\nSDK evaluate failed at frame %llu.\n",
-                    static_cast<unsigned long long>(frameIdx));
-            break;
-        }
-        if (!encoder.writeFrame(outFrame.data(), outFrame.size()))
-        {
-            fprintf(stderr, "\nEncoder pipe write failed at frame %llu "
-                            "(ffmpeg encoder likely exited early).\n",
-                    static_cast<unsigned long long>(frameIdx));
-            encoderDied = true;
-            break;
-        }
-        ++frameIdx;
-
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - tLast).count() >= 250)
-        {
-            double secs = std::chrono::duration<double>(now - tStart).count();
-            double fps  = secs > 0 ? frameIdx / secs : 0.0;
-            double pct  = info.frameCount > 0
-                        ? 100.0 * static_cast<double>(frameIdx) / static_cast<double>(info.frameCount)
-                        : 0.0;
-            printf("\r  Frame %llu / %lld  (%.1f%%, %.1f fps)   ",
-                   static_cast<unsigned long long>(frameIdx),
-                   static_cast<long long>(info.frameCount),
-                   pct, fps);
-            fflush(stdout);
-            tLast = now;
-        }
-    }
-    printf("\n");
-
-    // Dump captured ffmpeg stderr BEFORE finish() (finish deletes the logs).
-    if (encoderDied) encoder.dumpStderrTail("ffmpeg encoder");
-    if (decoderDied) decoder.dumpStderrTail("ffmpeg decoder");
-
-    encoder.finish();
-    decoder.finish();
-    converter.shutdown();
-
-    // Scrub a partial/empty output file so users don't get confused.
-    if ((encoderDied || decoderDied) && frameIdx == 0)
-    {
-        std::error_code ec;
-        fs::remove(output, ec);
-    }
-
-    auto tEnd = std::chrono::steady_clock::now();
-    double secs = std::chrono::duration<double>(tEnd - tStart).count();
-
-    if (encoderDied || decoderDied)
-    {
-        fprintf(stderr,
-                "Pipeline aborted after %llu frame(s). No output written.\n"
-                "Tip: re-run with --verbose to see full ffmpeg output, or try\n"
-                "     --no-hw-decode if you suspect NVDEC doesn't like this file.\n",
-                static_cast<unsigned long long>(frameIdx));
-        return 5;
-    }
-
-    printf("Done. %llu frames in %.1f s (%.1f fps).\n",
-           static_cast<unsigned long long>(frameIdx), secs,
-           secs > 0 ? frameIdx / secs : 0.0);
-    printf("Wrote: %s\n", output.c_str());
     return 0;
 }
 
 } // namespace
 
 // --------------------------------------------------------------------------
-// main
+// cliMain: the full command-line / interactive-wizard entry point.
+//
+// Exposed via engine.h so it can be driven from two places:
+//   1. The standalone console build (src/cli_entry.cpp -> main -> cliMain).
+//   2. The merged GUI binary, whose wWinMain forwards here when the app is
+//      launched with command-line arguments instead of double-clicked.
 // --------------------------------------------------------------------------
 
-int main(int argc, char** argv)
+int sdr2hdr::cliMain(int argc, char** argv)
 {
 #ifdef _WIN32
     // 1) Make the console use UTF-8 so printf/cout of non-ASCII (e.g. Chinese
@@ -1656,6 +1295,8 @@ int main(int argc, char** argv)
     ParseResult pr = parseArgs(argc, argv, positional, outputTarget, outputExplicit, wantWizard, opts);
     if (pr == ParseResult::Help)  return 0;
     if (pr == ParseResult::Error) return 1;
+
+    startCancelEventWatcher();
 
     // Detect interactive launch (so we pause at end):
     //   - no args at all (double-click),

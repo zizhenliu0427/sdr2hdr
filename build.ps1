@@ -9,10 +9,12 @@
         powershell -ExecutionPolicy Bypass -File .\build.ps1
         powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean
         powershell -ExecutionPolicy Bypass -File .\build.ps1 -Config Debug
+        powershell -ExecutionPolicy Bypass -File .\build.ps1 -GUI
 #>
 param(
     [string]$Config = "Release",
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$GUI
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,11 +30,42 @@ if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item -Recurse -Force $BuildDir
 }
 
+# Auto-detect an installed NVIDIA SDK by a signature file, so the build does not
+# prompt every time. Checks explicit candidates first, then globs common roots
+# (D:\, E:\, C:\, the user's Downloads, and next to / inside the repo).
+function Find-NvSdk {
+    param(
+        [Parameter(Mandatory)][string]$Signature,  # relative path that must exist, e.g. "include\nvsdk_ngx.h"
+        [Parameter(Mandatory)][string]$NameGlob,    # folder name pattern, e.g. "RTX_Video_SDK*"
+        [string[]]$Extra = @()                      # explicit full-path candidates, checked first
+    )
+    foreach ($c in $Extra) {
+        if ($c -and (Test-Path (Join-Path $c $Signature))) { return $c }
+    }
+    $roots = @("D:\", "E:\", "C:\", (Join-Path $env:USERPROFILE "Downloads"),
+               (Split-Path $ScriptDir -Parent), $ScriptDir)
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        $dirs = Get-ChildItem -Path $root -Directory -Filter $NameGlob -ErrorAction SilentlyContinue
+        foreach ($d in $dirs) {
+            if (Test-Path (Join-Path $d.FullName $Signature)) { return $d.FullName }
+        }
+    }
+    return $null
+}
+
 # 1. Resolve SDK roots --------------------------------------------------------
 
 # 1a. RTX Video SDK
 while ($true) {
     if (-not $env:NV_RTX_VIDEO_SDK) {
+        $autoRtx = Find-NvSdk -Signature "include\nvsdk_ngx.h" -NameGlob "RTX_Video_SDK*" `
+                              -Extra @((Join-Path $ScriptDir "vendor\rtx_video_sdk"))
+        if ($autoRtx) {
+            $env:NV_RTX_VIDEO_SDK = $autoRtx
+            Write-Host "RTX Video SDK: $autoRtx (auto-detected)" -ForegroundColor Green
+            break
+        }
         if ($isChinese) {
             Write-Host "未设置 NV_RTX_VIDEO_SDK 环境变量。" -ForegroundColor Yellow
             Write-Host "    请从以下地址下载 SDK:" -ForegroundColor Yellow
@@ -67,10 +100,11 @@ Write-Host "RTX Video SDK: $env:NV_RTX_VIDEO_SDK" -ForegroundColor Green
 # 1b. Video Codec SDK
 while ($true) {
     if (-not $env:NV_VIDEO_CODEC_SDK) {
-        $defaultNvcodec = Join-Path $ScriptDir "vendor\nvcodec"
-        if (Test-Path (Join-Path $defaultNvcodec "Interface\nvcuvid.h")) {
-            $env:NV_VIDEO_CODEC_SDK = $defaultNvcodec
-            Write-Host "Video Codec SDK: $defaultNvcodec (auto-detected)" -ForegroundColor Green
+        $autoNvc = Find-NvSdk -Signature "Interface\nvcuvid.h" -NameGlob "Video_Codec_SDK*" `
+                             -Extra @((Join-Path $ScriptDir "vendor\nvcodec"))
+        if ($autoNvc) {
+            $env:NV_VIDEO_CODEC_SDK = $autoNvc
+            Write-Host "Video Codec SDK: $autoNvc (auto-detected)" -ForegroundColor Green
             break
         }
         if ($isChinese) {
@@ -105,11 +139,15 @@ while ($true) {
 Write-Host "Video Codec SDK: $env:NV_VIDEO_CODEC_SDK" -ForegroundColor Green
 
 # 2. Locate toolchain pieces --------------------------------------------------
-# 2a. vcvars64.bat -- try vswhere first, then common paths.
+# 2a. vcvars64.bat. IMPORTANT: prefer Visual Studio 2022 (v143). CUDA 12.x's
+#     nvcc/cudafe++ crashes against VS 2026 (v145+) headers, and the RTX Video
+#     SDK v1.1.0 in turn needs CUDA 12.x (CUDA 13.x crashes its NGX runtime).
+#     So the only fully-working toolchain is VS 2022 + CUDA 12.x.
 $VcVars = $null
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (Test-Path $vsWhere) {
-    $vsRoot = & $vsWhere -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    # VS 2022 = v17.x; VS 2026 = v18.x. Pick 2022 first.
+    $vsRoot = & $vsWhere -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null | Select-Object -First 1
     if ($vsRoot) {
         $cand = Join-Path $vsRoot "VC\Auxiliary\Build\vcvars64.bat"
         if (Test-Path $cand) { $VcVars = $cand }
@@ -117,12 +155,26 @@ if (Test-Path $vsWhere) {
 }
 if (-not $VcVars) {
     foreach ($p in @(
-        "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
         "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
         "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
         "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
     )) {
         if (Test-Path $p) { $VcVars = $p; break }
+    }
+}
+# Last resort: newest VS (e.g. VS 2026). WARNS, because this forces CUDA 13.x
+# which crashes the RTX Video SDK NGX runtime at convert time.
+if (-not $VcVars -and (Test-Path $vsWhere)) {
+    $vsRoot = & $vsWhere -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if ($vsRoot) {
+        $cand = Join-Path $vsRoot "VC\Auxiliary\Build\vcvars64.bat"
+        if (Test-Path $cand) {
+            $VcVars = $cand
+            Write-Host "[!] Visual Studio 2022 not found; falling back to a newer VS." -ForegroundColor Yellow
+            Write-Host "    That forces CUDA 13.x, which CRASHES the RTX Video SDK v1.1.0 NGX" -ForegroundColor Yellow
+            Write-Host "    runtime during conversion. Install VS 2022 Build Tools (C++ workload)." -ForegroundColor Yellow
+        }
     }
 }
 if (-not $VcVars) {
@@ -172,18 +224,28 @@ if (-not $Ninja) {
 }
 Write-Host "ninja:   $NinjaPath"
 
-# 2c. nvcc (for a sanity message only; CMake will find it via CUDAToolkit).
-$nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
-if (-not $nvcc) {
-    foreach ($p in @(
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\nvcc.exe",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\nvcc.exe"
-    )) {
-        if (Test-Path $p) { Write-Host "nvcc:    $p"; break }
-    }
+# 2c. Pin CUDA to a 12.x toolkit (highest available). The RTX Video SDK v1.1.0
+#     NGX runtime crashes (stack overrun) when the app is built against CUDA
+#     13.x, so we force CUDA 12.x — overriding whatever CUDA_PATH points at.
+#     Honour an explicit override via $env:SDR2HDR_CUDA_ROOT.
+$cudaRoot = $env:SDR2HDR_CUDA_ROOT
+if (-not $cudaRoot) {
+    $cuda12 = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -Filter "v12.*" `
+              -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+    if ($cuda12) { $cudaRoot = $cuda12.FullName }
+}
+if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
+    $env:CUDA_PATH        = $cudaRoot
+    $env:CUDAToolkit_ROOT = $cudaRoot
+    $env:CUDACXX          = Join-Path $cudaRoot "bin\nvcc.exe"
+    $env:PATH             = (Join-Path $cudaRoot "bin") + ";" + $env:PATH
+    Write-Host "nvcc:    $($env:CUDACXX)  (pinned to CUDA 12.x for RTX Video SDK compatibility)" -ForegroundColor Green
 } else {
-    Write-Host "nvcc:    $($nvcc.Source)"
+    Write-Host "[!] No CUDA 12.x toolkit found under 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'." -ForegroundColor Yellow
+    Write-Host "    RTX Video SDK v1.1.0 needs CUDA 12.x; building with CUDA 13.x crashes NGX at" -ForegroundColor Yellow
+    Write-Host "    conversion time. Install CUDA 12.9 (Custom -> CUDA only) and re-run with -Clean." -ForegroundColor Yellow
+    $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+    if ($nvcc) { Write-Host "nvcc:    $($nvcc.Source)  (NOTE: not a 12.x toolkit)" }
 }
 
 # 3. Make sure cmake is on PATH ----------------------------------------------
@@ -223,7 +285,7 @@ set "CUDAFLAGS=-allow-unsupported-compiler %CUDAFLAGS%"
 
 echo.
 echo === Configuring ===
-cmake -S "$ScriptDir" -B "$BuildDir" -G Ninja -DCMAKE_BUILD_TYPE=$Config
+cmake -S "$ScriptDir" -B "$BuildDir" -G Ninja -DCMAKE_BUILD_TYPE=$Config -DCMAKE_TOOLCHAIN_FILE="$ScriptDir\cmake\cuda-no-probe.cmake" $(if ($GUI) { "-DBUILD_GUI=ON" } else { "" })
 if errorlevel 1 exit /b 1
 
 echo.
@@ -238,6 +300,53 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed (exit $LASTEXITCODE). Scroll up for the first error."
 }
 
+# 4b. Optional WinUI 3 GUI (MSBuild + Windows App SDK NuGet) -----------------
+if ($GUI) {
+    Write-Host "`n=== Building WinUI GUI ===" -ForegroundColor Cyan
+    $GuiDir = Join-Path $ScriptDir "gui"
+    $NugetExe = Join-Path $GuiDir "nuget.exe"
+    if (-not (Get-Command nuget -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path $NugetExe)) {
+            Write-Host "Downloading nuget.exe..." -ForegroundColor Yellow
+            Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile $NugetExe
+        }
+        $NugetCmd = $NugetExe
+    } else {
+        $NugetCmd = (Get-Command nuget).Source
+    }
+
+    & $NugetCmd restore (Join-Path $GuiDir "sdr2hdr_gui.vcxproj") -ConfigFile (Join-Path $GuiDir "nuget.config")
+    if ($LASTEXITCODE -ne 0) { throw "NuGet restore for GUI failed." }
+
+    $GuiBat = Join-Path $BuildDir "gui_build.bat"
+    $GuiBatBody = @"
+@echo off
+call "$VcVars"
+set "PATH=$NinjaDir;%PATH%"
+set "CUDAFLAGS=-allow-unsupported-compiler %CUDAFLAGS%"
+"$vsRootGuess\MSBuild\Current\Bin\MSBuild.exe" "$GuiDir\sdr2hdr_gui.vcxproj" /p:Configuration=$Config /p:Platform=x64 /p:Sdr2HdrBuildDir="$BuildDir" /p:Sdr2HdrSourceDir="$ScriptDir" /m /v:minimal
+"@
+    # Resolve MSBuild from same VS as vcvars
+    $VsRootFromVc = ($VcVars -replace "\\VC\\Auxiliary\\Build\\vcvars64\.bat$","")
+    $MsbuildPath = Join-Path $VsRootFromVc "MSBuild\Current\Bin\MSBuild.exe"
+    if (-not (Test-Path $MsbuildPath)) {
+        throw "MSBuild.exe not found at $MsbuildPath (WinUI GUI requires Visual Studio with Windows App SDK / WinUI workload)."
+    }
+    $GuiBatBody = @"
+@echo off
+call "$VcVars"
+"$MsbuildPath" "$GuiDir\sdr2hdr_gui.vcxproj" /p:Configuration=$Config /p:Platform=x64 /p:Sdr2HdrBuildDir="$BuildDir" /p:Sdr2HdrSourceDir="$ScriptDir" /m /v:minimal
+"@
+    Set-Content -Path $GuiBat -Value $GuiBatBody -Encoding Ascii
+    & cmd.exe /c "`"$GuiBat`""
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "[!] GUI build failed. Install Visual Studio with 'Windows application development' workload" -ForegroundColor Yellow
+        Write-Host "    (includes WinUI 3, C++/WinRT, Windows App SDK). Then open gui/sdr2hdr_gui.vcxproj." -ForegroundColor Yellow
+        throw "GUI build failed (exit $LASTEXITCODE)."
+    }
+}
+
 # 5. Report output -----------------------------------------------------------
 $ExePath = Join-Path $BuildDir "sdr2hdr.exe"
 if (Test-Path $ExePath) {
@@ -245,4 +354,26 @@ if (Test-Path $ExePath) {
     Write-Host "Try: `"$ExePath`" input.mp4 output.mp4 --hdr"
 } else {
     throw "Build completed but sdr2hdr.exe not found at $ExePath"
+}
+
+if ($GUI) {
+    $GuiExe = Join-Path $ScriptDir "gui\x64\$Config\sdr2hdr.exe"
+    if (-not (Test-Path $GuiExe)) {
+        $GuiExe = Join-Path $ScriptDir "gui\out\$Config\sdr2hdr_gui\sdr2hdr.exe"
+    }
+    if (Test-Path $GuiExe) {
+        Write-Host "GUI:   $GuiExe" -ForegroundColor Green
+        if ($isChinese) {
+            Write-Host "       这是合并后的单一二进制：双击打开图形界面，带参数则当命令行用。" -ForegroundColor DarkGray
+            Write-Host "       例如: `"$GuiExe`" input.mp4 output.mp4 --hdr" -ForegroundColor DarkGray
+            Write-Host "       (上面的控制台版 sdr2hdr.exe 仅用于无界面/CI 场景，发布只需带上这一个 GUI 程序。)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "       This is the merged single binary: double-click for the GUI, pass" -ForegroundColor DarkGray
+            Write-Host "       arguments to use it as the command-line tool. e.g." -ForegroundColor DarkGray
+            Write-Host "       `"$GuiExe`" input.mp4 output.mp4 --hdr" -ForegroundColor DarkGray
+            Write-Host "       (The console sdr2hdr.exe above is only for headless/CI use; ship just this one.)" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "GUI build requested; if sdr2hdr_gui.exe is missing, open gui/sdr2hdr_gui.vcxproj in Visual Studio (WinUI workload + nuget restore)." -ForegroundColor Yellow
+    }
 }

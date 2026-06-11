@@ -103,30 +103,101 @@ bool makePipe(PipePair& pipe, bool childReads)
     return true;
 }
 
+// Kill-on-close job object: every child we spawn is assigned to it, so when
+// this process exits -- normally, killed, or crashed -- the OS terminates all
+// remaining ffmpeg/ffprobe children automatically. Without it, closing the
+// GUI mid-conversion left the encoder ffmpeg running in the background.
+static HANDLE childJobObject()
+{
+    static HANDLE job = []() -> HANDLE
+    {
+        HANDLE h = CreateJobObjectW(nullptr, nullptr);
+        if (!h) return nullptr;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(h, JobObjectExtendedLimitInformation,
+                                     &li, sizeof(li)))
+        {
+            CloseHandle(h);
+            return nullptr;
+        }
+        return h;
+    }();
+    return job;
+}
+
 bool launch(const std::string& cmdline,
             HANDLE hStdin, HANDLE hStdout, HANDLE hStderr,
             PROCESS_INFORMATION& pi)
 {
-    STARTUPINFOW si{};
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdInput  = hStdin  ? hStdin  : GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = hStdout ? hStdout : GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError  = hStderr ? hStderr : GetStdHandle(STD_ERROR_HANDLE);
+    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST: restrict inheritance to exactly the
+    // stdio handles this child is given. With plain bInheritHandles=TRUE,
+    // every inheritable handle in the process leaks into every child -- and
+    // we launch children from multiple threads (e.g. the VFR ffprobe pass
+    // runs while the muxer ffmpeg starts). A child that accidentally
+    // inherits the write end of another child's pipe keeps that pipe from
+    // ever reaching EOF: observed as probeFramePts() hanging until the muxer
+    // exited, which itself waited on us -- a deadlock.
+    STARTUPINFOEXW six{};
+    six.StartupInfo.cb         = sizeof(six);
+    six.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
+    six.StartupInfo.hStdInput  = hStdin  ? hStdin  : GetStdHandle(STD_INPUT_HANDLE);
+    six.StartupInfo.hStdOutput = hStdout ? hStdout : GetStdHandle(STD_OUTPUT_HANDLE);
+    six.StartupInfo.hStdError  = hStderr ? hStderr : GetStdHandle(STD_ERROR_HANDLE);
+
+    // Dedupe (stderr often equals stdout) and drop pseudo-handles; the
+    // attribute list rejects duplicates and invalid entries.
+    HANDLE inherit[3];
+    DWORD  nInherit = 0;
+    for (HANDLE h : { six.StartupInfo.hStdInput,
+                      six.StartupInfo.hStdOutput,
+                      six.StartupInfo.hStdError })
+    {
+        if (!h || h == INVALID_HANDLE_VALUE) continue;
+        bool dup = false;
+        for (DWORD i = 0; i < nInherit; ++i) dup = dup || (inherit[i] == h);
+        if (!dup) inherit[nInherit++] = h;
+    }
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    bool haveAttrs =
+        nInherit > 0 && attrSize > 0 &&
+        InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
+        UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherit, nInherit * sizeof(HANDLE),
+                                  nullptr, nullptr);
+    six.lpAttributeList = haveAttrs ? attrs : nullptr;
 
     std::wstring wcmd = toWide(cmdline);
     std::vector<wchar_t> wbuf(wcmd.begin(), wcmd.end());
     wbuf.push_back(L'\0');
 
+    // CREATE_NO_WINDOW: ffmpeg/ffprobe are console programs; when a windowed
+    // (GUI) parent with no console of its own spawns them, Windows would pop up
+    // an empty console window for each child. This suppresses it. Harmless for
+    // the CLI build (stdio is already redirected through the inherited handles).
+    // CREATE_SUSPENDED: assign to the kill-on-close job before the child runs
+    // a single instruction, so there is no window where it could outlive us.
+    DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED |
+                  (haveAttrs ? EXTENDED_STARTUPINFO_PRESENT : 0);
     BOOL ok = CreateProcessW(
         nullptr, wbuf.data(),
         nullptr, nullptr,
-        TRUE, 0, nullptr, nullptr,
-        &si, &pi);
+        TRUE, flags, nullptr, nullptr,
+        &six.StartupInfo, &pi);
+    DWORD err = GetLastError();
+    if (haveAttrs)
+        DeleteProcThreadAttributeList(attrs);
     if (!ok) {
-        fprintf(stderr, "CreateProcess failed (%lu): %s\n", GetLastError(), cmdline.c_str());
+        fprintf(stderr, "CreateProcess failed (%lu): %s\n", err, cmdline.c_str());
         return false;
     }
+    if (HANDLE job = childJobObject())
+        AssignProcessToJobObject(job, pi.hProcess);   // best-effort
+    ResumeThread(pi.hThread);
     return true;
 }
 

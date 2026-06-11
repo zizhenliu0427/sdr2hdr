@@ -311,8 +311,10 @@ bool ensureFfmpeg(bool interactive)
 
 bool checkNgxDlls()
 {
-    const bool haveHdr = localPresent("nvngx_truehdr.dll");
-    const bool haveVsr = localPresent("nvngx_vsr.dll");
+    // Found if next to the exe OR resolvable via the standard DLL search path
+    // (PATH + current dir) — same "local OR global" rule used for ffmpeg.
+    const bool haveHdr = localPresent("nvngx_truehdr.dll") || onPath(L"nvngx_truehdr.dll");
+    const bool haveVsr = localPresent("nvngx_vsr.dll")     || onPath(L"nvngx_vsr.dll");
     if (haveHdr && haveVsr) return true;
 
     fprintf(stderr, tr(

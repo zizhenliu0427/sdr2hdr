@@ -23,7 +23,9 @@
 #include "rtx_converter.h"
 #include "ffmpeg_process.h"   // VideoInfo
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace sdr2hdr {
@@ -53,6 +55,12 @@ struct GpuPipelineOptions
     // Whether to copy original audio into the muxed output.
     bool copyAudio = true;
 
+    // VFR PTS passthrough (#32): re-stamp output frames with the source's
+    // per-frame timestamps instead of CFR-at-average-fps. Average fps keeps
+    // the endpoints aligned but drifts mid-file on VFR sources (measured
+    // +/-10 s on a 20-min PUBG DVR capture). Disabled via --no-vfr-pts.
+    bool ptsPassthrough = true;
+
     // NVENC target bitrate hint (kbps, 0 = auto derived from pixels*fps).
     // For a first version we use CQP with this "quality" integer mapped from
     // the CLI --quality flag; 0 means pick a sensible default.
@@ -62,8 +70,34 @@ struct GpuPipelineOptions
     // Empty = default p5.
     std::string preset = "";
 
+    // Number of parallel NGX feature sessions (#11): consecutive frames are
+    // striped across sessions, each bound to its own CUDA stream, so the
+    // RTX SDK inference -- the pipeline bottleneck -- overlaps across frames.
+    // 0 = auto (currently 2). 1 reproduces the serial behaviour.
+    int ngxSessions = 0;
+
     // Verbose ffmpeg stderr passthrough.
     bool verbose = false;
+
+    // Cooperative cancellation (GUI queue ✕ / window close). Checked by the
+    // progress loop; on cancel the pipeline tears down, deletes its temp
+    // files AND the partial output, and returns ok=false with
+    // errorDetail="Cancelled".
+    std::atomic<bool>* cancelFlag = nullptr;
+
+    // Optional GUI / engine progress hook (~4 Hz, worker thread).
+    struct ProgressUpdate {
+        uint64_t framesDone  = 0;
+        uint64_t framesTotal = 0;
+        double   elapsedSec  = 0.0;
+        double   fps         = 0.0;
+        double   percent     = 0.0;
+        // True for the post-encode finalize step (teardown + audio mux +
+        // A/V verify). All frames are done but the file isn't written yet —
+        // the UI shows "Finalizing…" instead of a frozen 100%.
+        bool     finalizing  = false;
+    };
+    std::function<void(const ProgressUpdate&)> onProgress;
 };
 
 struct GpuPipelineResult

@@ -1,8 +1,10 @@
-# sdr2hdr — RTX Video SDK command-line tool
+# sdr2hdr — RTX Video SDK HDR / VSR converter (GUI + CLI)
 
 > **Language / 语言**: **English** · [中文](README.zh.md)
 
-A command-line tool that applies NVIDIA RTX Video AI — RTX HDR (TrueHDR) and RTX VSR super-resolution — to videos and saves the processed result to a file. Unlike real-time playback filters (e.g. in Chrome or PotPlayer), sdr2hdr enables offline processing so you can keep the enhanced output.
+A Windows tool that applies NVIDIA RTX Video AI — RTX HDR (TrueHDR) and RTX VSR super-resolution — to videos and saves the processed result to a file. Unlike real-time playback filters (e.g. in Chrome or PotPlayer), sdr2hdr enables offline processing so you can keep the enhanced output.
+
+It ships as a **single binary**: double-click `sdr2hdr.exe` for the **WinUI 3 graphical interface** (drag-and-drop queue, mode/encoder panels, live ETA, dependency check), or pass command-line arguments to the *same* exe to use it as the **CLI / batch tool** (see [Usage](#usage)). The console workflow and the GUI share one engine.
 
 
 | Mode          | Purpose                                     | Colour space  | Resolution            |
@@ -176,12 +178,26 @@ cd tools\sdr2hdr
 
 ## Usage
 
-### 1) Interactive wizard
+### Graphical interface (default)
 
-**Double-click `sdr2hdr.exe`**, or run it **with no arguments** from a terminal:
+**Double-click `sdr2hdr.exe`** to open the WinUI 3 window:
+
+- **Drag video files** onto the drop zone (or *Add files…*); each row shows a ✕ to remove it.
+- Pick a **mode** (RTX HDR / RTX VSR / RTX VSR + HDR) — irrelevant options grey out automatically.
+- **Encoder**: GPU (NVENC) or CPU (Software). *The RTX HDR/VSR conversion always runs on the GPU* — this only changes the video encoder (CPU = software x265/x264/AV1).
+- Tune **codec / quality / peak nits / output resolution / VSR quality** (each with an ⓘ tooltip).
+- **Start conversion** — the queue shows live `45%  127.0 fps  ~2:13` (percent, fps, ETA), the Windows taskbar mirrors the progress, and a toast fires on completion. The final audio-merge step shows *Merging audio…* with an elapsed timer.
+- If you add a video that is **already HDR**, a banner warns you (sdr2hdr converts *SDR → HDR*).
+- **Command line** page: type CLI arguments and run them in a console. **Settings**: theme, language (EN/ZH), default output folder, and a dependency check (ffmpeg / NVNGX DLLs) with download links.
+
+> Same binary, two faces: with **no arguments** it shows the GUI; with arguments it behaves exactly like the CLI below.
+
+### Interactive console wizard
+
+The GUI binary shows the window when launched with no arguments, so to get the **console wizard** pass `--interactive` (or use the headless console build, which runs the wizard on a bare double-click):
 
 ```powershell
-.\sdr2hdr.exe
+.\sdr2hdr.exe --interactive
 ```
 
 A five-step wizard runs:
@@ -206,14 +222,14 @@ The wizard then prints a "Ready to process" summary — press **Y** to start, th
 
 **Drag-and-drop scenario**: drop one or more video files **onto the `sdr2hdr.exe` icon** and the wizard starts with the file list pre-filled (Step 1 is skipped).
 
-### 2) Single-file CLI
+### Single-file CLI
 
 ```powershell
 .\sdr2hdr.exe in.mp4 out.mp4 --hdr
 .\sdr2hdr.exe 1080p.mp4 4k.mp4 --vsr --4k
 ```
 
-### 3) Batch CLI
+### Batch CLI
 
 Any positional argument is treated as an input; use `-o` to specify the output directory (**omit `-o` and outputs are written next to each input**):
 
@@ -292,6 +308,8 @@ Encoding / pipeline options:
                        . generic names (fast/medium/slow) auto-map to each encoder's preset
   --no-hw-decode     disable NVDEC hardware decoding, use software decode instead
   --no-audio         do not copy the source audio
+  --no-vfr-pts       disable VFR timestamp passthrough; force CFR at average fps
+                     (VFR sources may drift mid-file)
   --gpu-only         native in-VRAM pipeline (default, fastest)
   --legacy           fall back to the older pipeline: ffmpeg pixel pipes + host-pointer RTX
   --verbose          show ffmpeg's stderr (helps with debugging)
@@ -402,25 +420,39 @@ All the recipient needs is **an NVIDIA RTX GPU + a recent driver** — no ffmpeg
 
 ## Roadmap
 
-### 🎯 v1.1 — WinUI 3 Graphical Interface
+> **Status:** **v1.1 WinUI 3 GUI is shipped** (#33, #37–#45 in `TODO.md`) — the GUI and CLI are now one binary. **v1.2 A/V reliability is mostly shipped**: the audio-sync / VFR fixes and per-frame VFR PTS passthrough (#32) landed on the GPU-only path, but subtitle/chapter passthrough, `--output-fps`, and HDR10 SEI are still open.
 
-A native Windows GUI built on WinUI 3 / Windows App SDK, replacing the console wizard for a more modern, visual workflow.
+### ✅ v1.1 — WinUI 3 Graphical Interface *(shipped)*
 
-- [ ] **Project scaffold** — WinUI 3 C++/WinRT project with WinAppSDK, integrating the existing `sdr2hdr` engine as a static library
-- [ ] **Main window** — drag-and-drop zone for video files, file picker button, recent-files list
-- [ ] **Mode selector** — toggle bar for HDR / VSR / VSR+HDR with live parameter panels (peak luminance slider, upscale target picker, codec/quality/preset selectors)
-- [ ] **Batch job queue** — data-grid view showing input file, status (pending / processing / done / failed), progress bar, ETA, fps
-- [ ] **Real-time preview** — side-by-side SDR vs HDR thumbnail (periodic frame grab from the SDK)
-- [ ] **Settings page** — default output directory, default codec/quality, ffmpeg/ngxs DLL path override, language (EN/ZH)
-- [ ] **About / updates** — version info, link to GitHub releases, update-check on startup
+A native Windows GUI built on WinUI 3 / Windows App SDK, merged with the CLI into a single `sdr2hdr.exe`.
 
-### 🔧 v1.2 — Transcode Quality & Reliability
+- [x] **Project scaffold** — WinUI 3 C++/WinRT project with WinAppSDK, the `sdr2hdr` engine as a shared static library
+- [x] **Main window** — drag-and-drop zone, file picker, queue list with per-row ✕ remove
+- [x] **Mode selector** — RTX HDR / VSR / VSR+HDR with live parameter panels; irrelevant options auto-disable; encoder GPU(NVENC)/CPU(software) switch; codec / quality / peak-nits / output-resolution / VSR-quality presets with ⓘ tooltips
+- [x] **Batch job queue** — status (pending / processing / done / failed), progress bar, live **ETA + fps**, taskbar progress, completion toast
+- [x] **Merged CLI + GUI binary** — no-args → GUI, args → CLI; in-app "Command line" page
+- [x] **Settings page** — default output directory, theme (system/light/dark), language (EN/ZH), dependency check (ffmpeg / NVNGX) with download links
+- [x] **About** — version, GitHub link, app icon, theme-aware ffmpeg / NVIDIA logos
+- [~] **Real-time preview** — *dropped*: the GPU pipeline doesn't expose intermediate frames and the output is HDR, so a live preview isn't feasible; the source-playback pane was removed
+- [ ] **Update-check on startup** — not yet implemented
 
-- [ ] **Fix audio-video desync** — see [Known Audio-Video Sync Issues](#known-audio-video-sync-issues) below; root cause is frame-rate drift between re-encoded video and copied audio
-- [ ] **VFR (variable frame rate) support** — detect VFR sources and use `-vsync cfr` or per-frame PTS remapping in the muxer
-- [ ] **Subtitle track passthrough** — `-map 0:s?` so ASS/SRT/PGS subs survive the remux
+### 🔧 v1.2 — Transcode Quality & Reliability *(partially shipped)*
+
+#### Shipped (GPU-only default path, 2026-06)
+
+- [x] **Fix audio-video desync (main path)** — VFR / inflated-fps detection (`probeVideo`), measured fps for mux/NVENC, two-pass mux (raw video → `remuxCopyAudio`), MKV audio interleaving fix, post-mux `verifyMuxOutput` sanity check. Tested: PUBG Game DVR VFR MP4, SVP/OBS MKV.
+- [x] **True VFR PTS passthrough (#32)** — the source's per-frame timestamps are captured in parallel with the encode (packet-level ffprobe) and written into the output's sample table (`mp4_retime.cpp` rewrites the stts box in place). CFR-at-average-fps only kept the endpoints aligned — a 20-min VFR capture drifted up to **±10.6 s mid-file**; with passthrough the per-frame drift is **0 ms**. Falls back to CFR (with a warning) on any mismatch; disable with `--no-vfr-pts`.
+
+#### Planned for v1.2
+
+- [ ] **Multi-process parallel conversion (#46)** — the headline v1.2 feature. A single process is hard-capped at ~125 fps @ 4K by NVIDIA's one-NGX-instance-per-process limit (GPU sits at ~33% utilisation); splitting the input into N time segments converted by N worker processes in parallel is the only way up (~2× expected with 2 workers). The worker-process model already ships (the GUI runs every conversion in `sdr2hdr_cli.exe` for crash isolation).
+- [ ] **Project slim-down (#49)** — the repo has grown past its purpose. Planned cuts: remove the `--legacy` pixel-pipe pipeline (the GPU path is a stable superset), archive completed TODO detail, and halve both READMEs. The GUI is the deliverable; the CLI remains as the internal worker / debugging entry.
+
+#### Remaining smaller items
+- [ ] **Output frame rate (`--output-fps`)** — drop frames during encode (e.g. 250→120 fps) without slow-motion (#34)
+- [ ] **Subtitle track passthrough** — `-map 0:s?` so ASS/SRT/PGS subs survive remux
 - [ ] **Chapter metadata copy** — `-map_metadata 0` to preserve chapters, titles, and tags
-- [ ] **HDR10 static metadata SEI** — inject SMPTE 2086 Mastering Display + CEA-861.3 MaxCLL/MaxFALL into NVENC output for strict HDR10 compliance
+- [ ] **HDR10 static metadata SEI** — strict SMPTE 2086 / CEA-861.3 SEI in the bitstream (today: NVENC VUI + container colour tags on GPU path; legacy ffmpeg path has `-master_display` / `-max_cll` when supported)
 
 ### 🚀 v1.3 — Advanced Features
 
@@ -442,37 +474,45 @@ A native Windows GUI built on WinUI 3 / Windows App SDK, replacing the console w
 
 ## Known Audio-Video Sync Issues
 
-The output video may have **audio-video desync** (audio drifts ahead or behind the video). This is a known issue with two root causes:
+**Status (2026-06):** The **GPU-only default path** (no `--legacy`) includes fixes for the issues below. Re-encode **from the original source** when possible. Already-broken exports without a source file may need manual ffmpeg remux (timestamp offset / trim); that is **not** part of the converter.
 
-### Root Cause 1: Frame-rate mismatch in the GPU-only pipeline
+See `TODO.md` #17–#31 for implementation details.
 
-In the GPU-only path, NVENC encodes at a fixed frame rate derived from the source's `r_frame_rate` (e.g. `24000/1001` for 23.976 fps). The muxer stamps timestamps using `-framerate num/den`. However:
+### What was going wrong
 
-- **VFR (variable frame rate) sources** — screen recordings, phone videos, and OBS captures often use VFR. The source's `r_frame_rate` is a *nominal* rate (e.g. 30/1), but actual frame durations vary. The muxer assumes CFR (constant frame rate), so audio and video gradually drift apart over the video's duration.
-- **`avg_frame_rate` vs `r_frame_rate` rounding** — `ffprobe` reports `avg_frame_rate = 119997/1000` (from frame_count/duration) while `r_frame_rate = 120/1`. Using the wrong one introduces ~25 ppm drift, which accumulates to ~1 second desync over an 11-hour video.
+**Frame-rate mismatch** — VFR sources (PUBG DVR, OBS) and inflated metadata fps (SVP 125 vs ~120 actual) made the muxer stamp video at the wrong CFR while audio was copied verbatim → whole-clip speed-up or drift.
 
-### Root Cause 2: Re-encode timing vs audio copy
+**Mux reliability** — Windows ffmpeg pipe + dual-input remux could drop the audio track (MP4) or cluster Opus at EOF (MKV → silent until seek).
 
-The audio is copied directly from the source (`-c:a copy`) with its original timestamps. The video is re-encoded with new timestamps from NVENC. If NVENC drops or duplicates frames (e.g. due to GPU load, thermal throttling, or pipeline back-pressure), the video's frame count diverges from the source, and the audio runs on the original timeline while video runs on the new one.
+**Re-encode vs audio copy** — NVENC outputs a new video timeline; if fps/frame count diverges from the source, audio and video no longer share the same clock.
 
-### Planned Fix
+### What is fixed (GPU-only path)
 
-The v1.2 fix will:
-1. **Extract per-frame PTS from the source** using `ffprobe -show_frames` or by parsing the container's timing metadata
-2. **Inject matching PTS into the NVENC output** before passing to the muxer, so video timestamps stay synchronised with the original audio
-3. **Add `-async 1`** to the muxer as a safety net for minor frame-count mismatches
-4. **Detect VFR sources** and either convert to CFR at the muxer level or warn the user
+| Fix | Purpose |
+|-----|---------|
+| VFR + measured fps in `probeVideo` | Use real average fps, not bogus `r_frame_rate` |
+| Two-pass mux | Encode raw ES → `remuxCopyAudio`; avoid pipe dual-input |
+| ES → video-only container → merge | Proper audio interleaving |
+| `verifyMuxOutput` after mux | Fail fast on start/end misalignment or EOF audio cluster |
+| Per-frame VFR PTS passthrough (#32) | Average-fps CFR drifts mid-file on long VFR sources (measured ±10.6 s at 7 min into a 20-min DVR clip — looks fine at start/end, desyncs when seeking); the output now carries the source's exact per-frame timestamps |
 
-### Workaround (current)
+### Still open
 
-If you experience desync, try:
+- **`--legacy` pipeline** — same class of mux issues may remain (#29)
+- **Salvaging old broken outputs** — manual ffmpeg only; no automatic repair in `sdr2hdr`
+
+### If you still see desync
+
+1. **Do not use `--legacy`** unless debugging — prefer the default GPU-only path.
+2. Re-run from the **original** recording, not a previously broken export.
+3. With `--verbose`, check for `verifyMuxOutput` errors after mux.
+4. Last resort (keep source audio):
+
 ```powershell
-# Force CFR conversion in the demuxer (helps with VFR sources)
-.\sdr2hdr.exe in.mp4 out.mp4 --hdr --legacy
-
-# Or re-sync audio after processing
-ffmpeg -i out.mp4 -i in.mp4 -map 0:v -map 1:a -c copy -shortest out_synced.mp4
+ffmpeg -i broken_out.mkv -i original.mkv -map 0:v -map 1:a -c copy -shortest fixed.mkv
 ```
+
+For **output frame-rate reduction** (e.g. 250→120 fps, no slow-motion) on an already-encoded file, use ffmpeg `fps=120` + re-encode; planned as `--output-fps` during conversion (#34).
 
 ---
 

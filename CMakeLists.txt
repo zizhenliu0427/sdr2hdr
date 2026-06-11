@@ -77,11 +77,13 @@ set(NVCODEC_WRAP_SRC
 # ---------------------------------------------------------------------------
 set(RTX_API_DIR "${RTX_SDK_ROOT}/samples/RTX_Video_API")
 
-add_executable(sdr2hdr
-    app.rc
-    src/main.cpp
+set(CORE_SOURCES
+    src/engine.cpp
+    src/path_utils.cpp
     src/rtx_converter.cpp
     src/ffmpeg_process.cpp
+    src/mp4_retime.cpp
+    src/ngx_session.cpp
     src/bitstream_pipe.cpp
     src/gpu_pipeline.cpp
     src/win32_utils.cpp
@@ -91,62 +93,62 @@ add_executable(sdr2hdr
     ${NVCODEC_WRAP_SRC}
 )
 
-target_include_directories(sdr2hdr PRIVATE
+add_library(sdr2hdr_core STATIC ${CORE_SOURCES})
+
+# Console build. The real logic lives in sdr2hdr::cliMain (src/main.cpp);
+# cli_entry.cpp just provides main(). The shipping binary is now the merged GUI
+# (gui/sdr2hdr_gui.vcxproj), which compiles src/main.cpp too and forwards to
+# cliMain when launched with command-line arguments. This console exe remains
+# for headless/CI use and keeps the NVNGX/ffmpeg DLL-copy step below working.
+add_executable(sdr2hdr app.rc src/cli_entry.cpp src/main.cpp)
+target_link_libraries(sdr2hdr PRIVATE sdr2hdr_core)
+
+target_include_directories(sdr2hdr_core PUBLIC
     src
     "${RTX_SDK_ROOT}/include"
     "${RTX_API_DIR}"
     "${NVCODEC_ROOT}/Interface"
-    # Needed so "../Utils/NvCodecUtils.h" in NvDecoder.h / NvEncoder.h resolves
-    # to Samples/Utils/NvCodecUtils.h via the compiler's -I fallback search.
     "${NVCODEC_SAMPLES}/NvCodec"
     "${NVCODEC_SAMPLES}/Utils"
 )
 
-target_link_directories(sdr2hdr PRIVATE
+target_link_directories(sdr2hdr_core PUBLIC
     "${RTX_SDK_ROOT}/lib/Windows/x64"
     "${NVCODEC_ROOT}/Lib/win/x64"
 )
 
-target_link_libraries(sdr2hdr PRIVATE
+target_link_libraries(sdr2hdr_core PUBLIC
     CUDA::cuda_driver
     CUDA::cudart
     nvcuvid
     nvencodeapi
 )
 
-target_compile_features(sdr2hdr PRIVATE cxx_std_17)
+target_compile_features(sdr2hdr_core PUBLIC cxx_std_17)
+target_compile_features(sdr2hdr PUBLIC cxx_std_17)
 
-# The NvCodec sample wrappers emit "'sprintf': deprecated", many
-# conversion / unreferenced-parameter warnings. Silence them so our own
-# build output stays readable. They're upstream code; we don't patch.
 set_source_files_properties(${NVCODEC_WRAP_SRC} PROPERTIES
     COMPILE_FLAGS "/W0 /wd4819"
 )
 
 if(MSVC)
-    target_compile_options(sdr2hdr PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/W3>
-        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
-        # /bigobj needed because NvEncoder.cpp has many template instantiations.
-        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
-        # main.cpp embeds Chinese string literals (i18n wizard translations).
-        # Without /utf-8 MSVC reads the source as the system ACP (CP936 on
-        # Chinese Windows) and bakes wrong bytes into the binary, producing
-        # mojibake on even UTF-8-enabled consoles. /utf-8 = /source-charset:utf-8
-        # + /execution-charset:utf-8 which matches how we treat all strings.
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-    )
-    target_compile_definitions(sdr2hdr PRIVATE
-        _CRT_SECURE_NO_WARNINGS
-        NOMINMAX
-        WIN32_LEAN_AND_MEAN
-    )
-    # The RTX Video SDK ships /MD (dynamic runtime) default libs. Match that
-    # unless the user overrides CMAKE_MSVC_RUNTIME_LIBRARY at configure time.
-    if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
-        set_property(TARGET sdr2hdr PROPERTY
-            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-    endif()
+    foreach(T sdr2hdr sdr2hdr_core)
+        target_compile_options(${T} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/W3>
+            $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+            $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        )
+        target_compile_definitions(${T} PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+        if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+            set_property(TARGET ${T} PROPERTY
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+        endif()
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

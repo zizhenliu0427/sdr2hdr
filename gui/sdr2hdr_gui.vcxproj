@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>sdr2hdr_gui</RootNamespace>
+    <!-- Output filename: the merged GUI+CLI binary ships as sdr2hdr.exe. -->
+    <TargetName>sdr2hdr</TargetName>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.17763.0</WindowsTargetPlatformMinVersion>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <AppxPackage>false</AppxPackage>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>true</WinUISDKReferences>
+    <XamlLanguage>CppWinRT</XamlLanguage>
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <AppContainerApplication>false</AppContainerApplication>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)x64\Debug\</OutDir>
+    <IntDir>$(ProjectDir)x64\Debug\obj\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)x64\Release\</OutDir>
+    <IntDir>$(ProjectDir)x64\Release\obj\</IntDir>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+
+  <PropertyGroup Label="UserMacros">
+    <Sdr2HdrBuildDir Condition="'$(Sdr2HdrBuildDir)'==''">$(ProjectDir)..\build</Sdr2HdrBuildDir>
+    <Sdr2HdrSourceDir Condition="'$(Sdr2HdrSourceDir)'==''">$(ProjectDir)..</Sdr2HdrSourceDir>
+  </PropertyGroup>
+
+  <!-- Native WinUI 3: wire XAML compiler into the MSVC build (see Microsoft.Windows.UI.Xaml.Cpp.targets) -->
+  <PropertyGroup>
+    <GeneratedFilesDir Condition="'$(GeneratedFilesDir)' == ''">$(IntDir)Generated Files\</GeneratedFilesDir>
+    <XamlGeneratedOutputPath Condition="'$(XamlGeneratedOutputPath)' == ''">$(IntDir)</XamlGeneratedOutputPath>
+    <BeforeClCompileTargets>
+      Sdr2HdrPrepareXaml;
+      $(BeforeClCompileTargets)
+    </BeforeClCompileTargets>
+    <MarkupCompilePass1DependsOn>
+      ResolveReferences;
+      $(MarkupCompilePass1DependsOn)
+    </MarkupCompilePass1DependsOn>
+    <MarkupCompilePass2DependsOn>
+      ResolveReferences;
+      CppWinRTSetXamlLocalAssembly;
+      $(MarkupCompilePass2DependsOn)
+    </MarkupCompilePass2DependsOn>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(Sdr2HdrSourceDir)\src;$(ProjectDir);$(IntDir);$(GeneratedFilesDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories>$(Sdr2HdrBuildDir);$(CUDA_PATH)\lib\x64;$(NV_VIDEO_CODEC_SDK)\Lib\win\x64;$(NV_RTX_VIDEO_SDK)\lib\Windows\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>sdr2hdr_core.lib;cudart.lib;cuda.lib;nvcuvid.lib;nvencodeapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(Sdr2HdrSourceDir)\src;$(ProjectDir);$(IntDir);$(GeneratedFilesDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateMapFile>true</GenerateMapFile>
+      <AdditionalLibraryDirectories>$(Sdr2HdrBuildDir);$(CUDA_PATH)\lib\x64;$(NV_VIDEO_CODEC_SDK)\Lib\win\x64;$(NV_RTX_VIDEO_SDK)\lib\Windows\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>sdr2hdr_core.lib;cudart.lib;cuda.lib;nvcuvid.lib;nvencodeapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Copy brand logos (Assets\*.svg) next to the exe so the About page can
+       show them, and the console engine as sdr2hdr_cli.exe: the GUI runs
+       conversions in that worker process for crash isolation (NVIDIA's NGX
+       init stack-smashes GUI-classified processes on hybrid-graphics
+       machines; the console process is never routed through that path). -->
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>if not exist "$(OutDir)Assets" mkdir "$(OutDir)Assets"
+xcopy /Y /D "$(ProjectDir)Assets\*" "$(OutDir)Assets\" &gt;nul
+copy /Y "$(Sdr2HdrBuildDir)\sdr2hdr.exe" "$(OutDir)sdr2hdr_cli.exe" &gt;nul</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <Midl Include="MainWindow.idl" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h" />
+    <ClInclude Include="MainWindow.xaml.h" />
+    <ClInclude Include="JobQueue.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="App.xaml.cpp" />
+    <ClCompile Include="MainWindow.xaml.cpp" />
+    <ClCompile Include="JobQueue.cpp" />
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+    <ClCompile Include="XamlTypeInfo.cpp" />
+    <!-- Shared CLI entry: same conversion logic as the console build. The GUI
+         forwards to sdr2hdr::cliMain when launched with command-line args.
+         Does not use the WinRT pch. -->
+    <ClCompile Include="..\src\main.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- App icon (reuses the console build's app.ico via gui/app.rc). -->
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+    <Page Include="MainWindow.xaml">
+      <SubType>Designer</SubType>
+    </Page>
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CppWinRT" Version="2.0.240405.15" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.260224002" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- Pass1 uses ReferencePath; Pass2 uses XamlReferencesToCompile / WinMDReferenceToCompile -->
+  <Target Name="AddWinUIWinMDToXamlReferencePath"
+          BeforeTargets="MarkupCompilePass1;MarkupCompilePass2"
+          DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <ReferencePath Include="@(WinMDReferenceToCompile)" Condition="'%(WinMDReferenceToCompile.WinMDFile)' == 'true'" />
+      <XamlReferencesToCompile Include="@(WinMDReferenceToCompile)" Condition="'%(WinMDReferenceToCompile.WinMDFile)' == 'true'" />
+      <_WinUiWinMD Include="$(PkgMicrosoft_WindowsAppSDK)\lib\uap10.0\*.winmd" />
+      <_WinUiWinMD Include="$(PkgMicrosoft_WindowsAppSDK)\lib\uap10.0.17763\*.winmd" />
+      <ReferencePath Include="@(_WinUiWinMD)" Condition="Exists('$(PkgMicrosoft_WindowsAppSDK)\lib\uap10.0\Microsoft.UI.Xaml.winmd')" />
+      <XamlReferencesToCompile Include="@(_WinUiWinMD)" Condition="Exists('$(PkgMicrosoft_WindowsAppSDK)\lib\uap10.0\Microsoft.UI.Xaml.winmd')" />
+      <ReferencePath Include="$(FacadeWinmdPath)" Condition="Exists('$(FacadeWinmdPath)')" />
+      <XamlReferencesToCompile Include="$(FacadeWinmdPath)" Condition="Exists('$(FacadeWinmdPath)')" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="Sdr2HdrPrepareXaml"
+          DependsOnTargets="MarkupCompilePass1;_Midl;CppWinRTMergeProjectWinMDInputs;CppWinRTCopyWinMDToOutputDirectory;CppWinRTAddXamlMetaDataProviderCpp;CppWinRTMakeProjections;MarkupCompilePass2" />
+
+  <Target Name="CopyRuntimeDeps" AfterTargets="Build">
+    <Copy SourceFiles="$(Sdr2HdrBuildDir)\nvngx_truehdr.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(Sdr2HdrBuildDir)\nvngx_truehdr.dll')" />
+    <Copy SourceFiles="$(Sdr2HdrBuildDir)\nvngx_vsr.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(Sdr2HdrBuildDir)\nvngx_vsr.dll')" />
+    <Copy SourceFiles="$(Sdr2HdrBuildDir)\ffmpeg.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(Sdr2HdrBuildDir)\ffmpeg.exe')" />
+    <Copy SourceFiles="$(Sdr2HdrBuildDir)\ffprobe.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(Sdr2HdrBuildDir)\ffprobe.exe')" />
+  </Target>
+  <Target Name="AddProcessedXamlFilesToCopyLocal" />
+</Project>

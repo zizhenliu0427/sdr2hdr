@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "jMQPkvKWBII=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\lzz28\\VSCode Project\\sdr2hdr\\gui\\sdr2hdr_gui.vcxproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\lzz28\\.nuget\\packages\\microsoft.web.webview2\\1.0.2903.40\\microsoft.web.webview2.1.0.2903.40.nupkg.sha512",
+    "C:\\Users\\lzz28\\.nuget\\packages\\microsoft.windows.cppwinrt\\2.0.240405.15\\microsoft.windows.cppwinrt.2.0.240405.15.nupkg.sha512",
+    "C:\\Users\\lzz28\\.nuget\\packages\\microsoft.windows.sdk.buildtools\\10.0.26100.1742\\microsoft.windows.sdk.buildtools.10.0.26100.1742.nupkg.sha512",
+    "C:\\Users\\lzz28\\.nuget\\packages\\microsoft.windowsappsdk\\1.7.260224002\\microsoft.windowsappsdk.1.7.260224002.nupkg.sha512"
+  ],
+  "logs": []
+}

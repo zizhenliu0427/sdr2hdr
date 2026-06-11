@@ -8,6 +8,7 @@
 #include "gpu_pipeline.h"
 #include "bitstream_pipe.h"
 #include "cuda_kernels.h"
+#include "ngx_session.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -35,6 +36,7 @@ simplelogger::Logger* logger =
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -158,15 +160,20 @@ void configureEncoder(NvEncoder& enc,
     initParams.darWidth     = outW;
     initParams.darHeight    = outH;
 
-    // Derive frameRateNum/Den from fps (round to sensible rational).
+    // Frame rate for NVENC rate-control hints. When probeVideo filled an
+    // exact rational (including VFR -> avg_frame_rate), use it directly
+    // instead of re-rounding the double and picking the wrong heuristic.
     double fps = opts.input.fps > 0.1 ? opts.input.fps : 30.0;
-    // Heuristic: common frame rates
     auto setRational = [&](uint32_t num, uint32_t den)
     {
         initParams.frameRateNum = num;
         initParams.frameRateDen = den;
     };
-    if      (fabs(fps - 23.976) < 0.05) setRational(24000, 1001);
+    if (opts.input.fpsNum && opts.input.fpsDen)
+    {
+        setRational(opts.input.fpsNum, opts.input.fpsDen);
+    }
+    else if      (fabs(fps - 23.976) < 0.05) setRational(24000, 1001);
     else if (fabs(fps - 24.0)   < 0.05) setRational(24, 1);
     else if (fabs(fps - 25.0)   < 0.05) setRational(25, 1);
     else if (fabs(fps - 29.97)  < 0.05) setRational(30000, 1001);
@@ -246,6 +253,14 @@ void configureEncoder(NvEncoder& enc,
         hevc.repeatSPSPPS    = 1;
         hevc.outputAUD       = 1;       // write Access Unit Delimiter NALs
 
+        // Colour description always goes into the bitstream VUI: container-
+        // level -color_* flags are ignored by ffmpeg's stream copy (observed
+        // on 7.x/8.x), so VUI is the only tag that reliably survives the
+        // two-pass mux. SDR gets explicit BT.709 rather than "unspecified".
+        auto& vui = hevc.hevcVUIParameters;
+        vui.videoSignalTypePresentFlag   = 1;
+        vui.videoFullRangeFlag           = 0;               // limited range
+        vui.colourDescriptionPresentFlag = 1;
         if (hdrOut)
         {
             // Don't flip outputMaxCll / outputMasteringDisplay without also
@@ -253,13 +268,15 @@ void configureEncoder(NvEncoder& enc,
             // driver versions will either reject the config or write a
             // malformed empty SEI. VUI below is what HDR10 players actually
             // key off in practice.
-            auto& vui = hevc.hevcVUIParameters;
-            vui.videoSignalTypePresentFlag   = 1;
-            vui.videoFullRangeFlag           = 0;           // limited range
-            vui.colourDescriptionPresentFlag = 1;
             vui.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
             vui.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
             vui.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+        }
+        else
+        {
+            vui.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+            vui.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+            vui.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
         }
     }
     else if (codecGuid == NV_ENC_CODEC_H264_GUID)
@@ -270,6 +287,13 @@ void configureEncoder(NvEncoder& enc,
         h264.repeatSPSPPS    = 1;
         h264.outputAUD       = 1;
         // (H.264 is 8-bit in the SDR path only; HDR on H.264 is unusual.)
+        auto& vui = h264.h264VUIParameters;
+        vui.videoSignalTypePresentFlag   = 1;
+        vui.videoFullRangeFlag           = 0;
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        vui.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        vui.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
     }
     else if (codecGuid == NV_ENC_CODEC_AV1_GUID)
     {
@@ -287,6 +311,13 @@ void configureEncoder(NvEncoder& enc,
             av1.colorRange              = 0;
             av1.outputMaxCll            = 1;
             av1.outputMasteringDisplay  = 1;
+        }
+        else
+        {
+            av1.colorPrimaries          = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+            av1.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+            av1.matrixCoefficients      = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+            av1.colorRange              = 0;
         }
     }
 }
@@ -371,7 +402,11 @@ GpuPipelineResult runGpuOnly(const std::string& input,
         return bailout("No CUDA GPUs visible");
     if (cuDeviceGet(&cuDev, 0) != CUDA_SUCCESS)
         return bailout("cuDeviceGet failed");
+#if CUDA_VERSION >= 13000
+    if (cuCtxCreate(&cuCtx, nullptr, 0, cuDev) != CUDA_SUCCESS)
+#else
     if (cuCtxCreate(&cuCtx, 0, cuDev) != CUDA_SUCCESS)
+#endif
         return bailout("cuCtxCreate failed");
 
     // Dedicated non-default CUDA stream for our kernels + RTX SDK. Using the
@@ -388,9 +423,21 @@ GpuPipelineResult runGpuOnly(const std::string& input,
 
     // ------------------------------------------------------------------
     // 2. Demuxer
+    //
+    // VFR PTS passthrough (#32): the demuxer's ffmpeg also writes every
+    // packet's exact pts to a small side file (second -f framecrc output).
+    // This replaces the old parallel ffprobe pass, which re-read the entire
+    // source while the demuxer was reading it -- on slow/network drives the
+    // two readers halved throughput until the probe finished.
     // ------------------------------------------------------------------
+    const bool wantPtsPassthrough =
+        opts.copyAudio && !input.empty() && opts.ptsPassthrough &&
+        (opts.codec == "hevc" || opts.codec == "h265" || opts.codec == "h264");
+    const std::string tsCapturePath =
+        wantPtsPassthrough ? output + ".sdr2hdr.ts.txt" : std::string();
+
     BitstreamDemuxer demuxer;
-    if (!demuxer.start(input, opts.input.codecName, opts.verbose))
+    if (!demuxer.start(input, opts.input.codecName, opts.verbose, tsCapturePath))
     {
         if (stream) cudaStreamDestroy(stream);
         cuCtxDestroy(cuCtx);
@@ -422,31 +469,104 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     }
 
     // ------------------------------------------------------------------
-    // 4. RTX converter (uses our context)
+    // 4. NGX sessions (direct), or the RTX sample wrapper as fallback.
+    //
+    // The direct path creates `numSessions` independent NGX feature
+    // instances, each bound to its own CUDA stream; consecutive frames are
+    // striped across them so the inference -- the pipeline's bottleneck --
+    // overlaps frame-to-frame (#11). The legacy RtxConverter wrapper stays
+    // as a fallback: its deviceptr path stages through synchronous
+    // cuMemcpy2D, which serialises the whole context every frame.
     // ------------------------------------------------------------------
-    RtxConverter rtx;
-    if (!rtx.initializeWithContext(opts.mode, inW, inH, outW, outH,
-                                   cuCtx, stream, 0))
+    // Auto = 1: NGX hard-limits TrueHDR/VSR to one live feature instance per
+    // process (FeatureAlreadyExists, verified on driver 610.47), so asking
+    // for more just produces a failed create + fallback noise. The striping
+    // machinery stays in place for a future multi-process sharding mode.
+    int numSessions = opts.ngxSessions > 0 ? opts.ngxSessions : 1;
+    if (numSessions > 4) numSessions = 4;
+
+    std::vector<cudaStream_t> sessStream;
+    std::vector<std::unique_ptr<NgxSession>> sessions;
+    RtxConverter rtx;                 // fallback only
+    bool ngxDirect = ngxRuntimeInit();
+
+    auto destroySessions = [&]()
     {
-        demuxer.finish();
-        dec.reset();
-        if (stream) cudaStreamDestroy(stream);
-        cuCtxDestroy(cuCtx);
-        return bailout("RtxConverter init failed");
+        sessions.clear();             // releases NGX features + arrays
+        for (cudaStream_t s : sessStream)
+            if (s) cudaStreamDestroy(s);
+        sessStream.clear();
+        ngxRuntimeShutdown();
+    };
+
+    if (ngxDirect)
+    {
+        for (int i = 0; i < numSessions; ++i)
+        {
+            cudaStream_t s = nullptr;
+            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess)
+                break;
+            auto sess = std::make_unique<NgxSession>();
+            if (!sess->init(opts.mode, inW, inH, outW, outH, cuCtx, s))
+            {
+                sess->shutdown();
+                cudaStreamDestroy(s);
+                break;
+            }
+            sessStream.push_back(s);
+            sessions.push_back(std::move(sess));
+        }
+        if (sessions.empty())
+        {
+            ngxRuntimeShutdown();
+            ngxDirect = false;
+        }
+    }
+    numSessions = ngxDirect ? static_cast<int>(sessions.size()) : 1;
+
+    if (!ngxDirect)
+    {
+        if (!rtx.initializeWithContext(opts.mode, inW, inH, outW, outH,
+                                       cuCtx, stream, 0))
+        {
+            demuxer.finish();
+            dec.reset();
+            if (stream) cudaStreamDestroy(stream);
+            cuCtxDestroy(cuCtx);
+            return bailout("RtxConverter init failed");
+        }
+        sessStream.push_back(stream);   // kernels share the NVENC IO stream
     }
 
     // ------------------------------------------------------------------
-    // 5. Intermediate RGBA8 device buffers (RTX SDK input/output)
+    // 5. Intermediate RGBA8 device buffers (NGX input/output), one pair per
+    //    session. Within a session the stream serialises reuse; across
+    //    sessions the buffers are independent.
     // ------------------------------------------------------------------
-    DevBuffer rgbaIn, rgbaOut;
-    if (!rgbaIn.alloc(inW, inH, 4) ||
-        !rgbaOut.alloc(outW, outH, 4))
+    std::vector<DevBuffer> rgbaIn(numSessions), rgbaOut(numSessions);
+    bool allocOk = true;
+    for (int i = 0; i < numSessions; ++i)
+        allocOk = allocOk && rgbaIn[i].alloc(inW, inH, 4)
+                          && rgbaOut[i].alloc(outW, outH, 4);
+    if (!allocOk)
     {
-        rtx.shutdown(); demuxer.finish(); dec.reset();
+        if (ngxDirect) destroySessions(); else rtx.shutdown();
+        demuxer.finish(); dec.reset();
         if (stream) cudaStreamDestroy(stream);
         cuCtxDestroy(cuCtx);
         return bailout("cuMemAlloc for RGBA scratch failed");
     }
+
+    auto freeScratch = [&]()
+    {
+        for (auto& b : rgbaIn)  b.free_();
+        for (auto& b : rgbaOut) b.free_();
+    };
+    auto shutdownConvert = [&]()
+    {
+        if (ngxDirect) destroySessions();
+        else           rtx.shutdown();
+    };
 
     // ------------------------------------------------------------------
     // 6. NvEncoder (HEVC Main10 P010 for HDR / NV12 for SDR VSR)
@@ -478,8 +598,8 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     }
     catch (const std::exception& e)
     {
-        rgbaIn.free_(); rgbaOut.free_();
-        rtx.shutdown(); demuxer.finish(); dec.reset();
+        freeScratch();
+        shutdownConvert(); demuxer.finish(); dec.reset();
         if (stream) cudaStreamDestroy(stream);
         cuCtxDestroy(cuCtx);
         result.errorDetail = std::string("NvEncoder create failed: ") + e.what();
@@ -487,29 +607,82 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     }
 
     // ------------------------------------------------------------------
-    // 7. Muxer (receives Annex-B bitstream over stdin, muxes into opts.codec container)
+    // 7. Muxer (receives encoded bitstream, muxes into container)
     // ------------------------------------------------------------------
     MuxerOptions mo;
     mo.codec     = opts.codec;
     mo.width     = outW;
     mo.height    = outH;
     mo.fps       = opts.input.fps > 0.1 ? opts.input.fps : 30.0;
-    // Pass the exact rational NVENC just encoded with, so the mp4 muxer
-    // stamps identical container timestamps. Anything less precise (e.g.
-    // a double like 119.997) drifts from the VUI baked into the bitstream
-    // and can cause visible micro-stutter during playback.
     mo.fpsNum    = encInit.frameRateNum;
     mo.fpsDen    = encInit.frameRateDen;
     mo.hdr10     = hdrOut;
     mo.maxCll    = opts.maxLuminance;
     mo.copyAudio = opts.copyAudio;
+
+    // Pipe mux + a second file input for audio is unreliable on Windows ffmpeg:
+    // observed nb_streams=1 (MP4) and audio clustered at EOF (MKV). So when
+    // audio is copied we mux in two passes: the encoded stream is piped into
+    // a video-only temp MP4 *during* the encode (single pipe input ->
+    // reliable; replaces the old raw-ES-to-disk + containerize passes, saving
+    // two full read/writes of the multi-GB stream), then remuxCopyAudio()
+    // merges the source audio. The temp MP4 is also where the VFR re-timing
+    // (#32) is applied -- mp4_retime.cpp needs an MP4 with moov last.
+    //
+    // AV1 keeps the raw-ES path: the hevc/h264 pipe demuxers used by the
+    // temp-MP4 route don't apply to OBU streams.
+    const bool audioTwoPassMux =
+        mo.copyAudio && !input.empty();
+    const bool pipeTempMp4 =
+        audioTwoPassMux && opts.codec != "av1";
+    std::string tempVideoOnly;
+    std::string muxTarget = output;
+    if (audioTwoPassMux)
+    {
+        // Sweep stale temp artifacts a previous crashed/killed run may have
+        // left next to this output (incl. names from older versions).
+        for (const char* suffix : { ".sdr2hdr.vidonly.mp4",
+                                    ".sdr2hdr.vidonly.hevc",
+                                    ".sdr2hdr.vidonly.h264" })
+        {
+            std::error_code ec;
+            std::filesystem::remove(output + suffix, ec);
+            std::filesystem::remove(output + suffix + ".mux.mkv", ec);
+            std::filesystem::remove(output + suffix + ".mux.mp4", ec);
+        }
+
+        if (pipeTempMp4)
+        {
+            tempVideoOnly = output + ".sdr2hdr.vidonly.mp4";
+            muxTarget     = tempVideoOnly;
+        }
+        else
+        {
+            const char* esExt = (opts.codec == "h264") ? ".h264" : ".hevc";
+            tempVideoOnly = output + ".sdr2hdr.vidonly" + esExt;
+            mo.rawOutputPath = tempVideoOnly;
+        }
+        mo.copyAudio = false;
+        if (opts.input.isVfr)
+        {
+            fprintf(stderr,
+                    "Note: VFR source (nominal %.2f fps, average %.2f fps). "
+                    "Two-pass mux at %u/%u fps + audio copy.\n",
+                    opts.input.rFps, opts.input.avgFps, mo.fpsNum, mo.fpsDen);
+        }
+        else
+        {
+            printf("  mux: two-pass (video-only mp4 -> remux with audio copy)\n");
+        }
+    }
+
     BitstreamMuxer muxer;
-    if (!muxer.start(input, output, mo, opts.verbose))
+    if (!muxer.start(input, muxTarget, mo, opts.verbose))
     {
         try { enc->DestroyEncoder(); } catch (...) {}
         enc.reset();
-        rgbaIn.free_(); rgbaOut.free_();
-        rtx.shutdown(); demuxer.finish(); dec.reset();
+        freeScratch();
+        shutdownConvert(); demuxer.finish(); dec.reset();
         if (stream) cudaStreamDestroy(stream);
         cuCtxDestroy(cuCtx);
         return bailout("Failed to start BitstreamMuxer");
@@ -541,6 +714,11 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     // ------------------------------------------------------------------
 
     printf("GPU-only pipeline: NVDEC -> CUDA -> RTX SDK -> NVENC -> mux (3-thread)\n");
+    if (ngxDirect)
+        printf("  ngx: direct, %d session%s (frames striped across CUDA streams)\n",
+               numSessions, numSessions > 1 ? "s" : "");
+    else
+        printf("  ngx: RTX sample wrapper fallback (single session, synchronous)\n");
     printf("  in:  %s  %ux%u  %.3f fps  %s  %d-bit (%s)\n",
            input.c_str(), inW, inH, opts.input.fps,
            opts.input.codecName.c_str(),
@@ -560,13 +738,11 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     // Decode() calls. It MUST be returned via UnlockFrame() after all
     // stream work reading from it has completed, otherwise the pool leaks
     // and eventually stalls.
-    struct DecodedFrame { uint8_t* devPtr; int pitch; };
+    struct DecodedFrame { uint8_t* devPtr; int pitch; size_t frameIndex; };
 
-    // --- Encoded packet descriptor passed to mux thread ---
-    // NvEncoder reuses its internal bitstream buffers across frames, so we
-    // copy the packet bytes into our own std::vector before handing to the
-    // mux thread. At ~10 MB/s average this is cheap.
+    // --- Encoded packet passed to mux thread (owning buffer + source index) ---
     using PacketBytes = std::vector<uint8_t>;
+    struct EncodedPacket { PacketBytes bytes; size_t frameIndex = 0; };
 
     // --- Bounded queues with blocking push/pop ---
     struct DecQueue
@@ -579,7 +755,7 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     };
     struct PktQueue
     {
-        std::deque<PacketBytes> q;
+        std::deque<EncodedPacket> q;
         std::mutex              m;
         std::condition_variable cv;
         bool                    closed = false;
@@ -588,7 +764,33 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     DecQueue decQ;
     PktQueue pktQ;
 
+    // Cross-stream sync: after a frame's last kernel on its session stream,
+    // record an event and make the NVENC IO stream wait on it before
+    // EncodeFrame. In-flight depth is bounded by NVENC's buffer ring (4), so
+    // a pool of 8 reusable events can never alias a live frame.
+    constexpr size_t kEvtPool = 8;
+    std::vector<cudaEvent_t> sessEvt;
+    if (ngxDirect)
+    {
+        sessEvt.resize(kEvtPool, nullptr);
+        for (auto& e : sessEvt)
+        {
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+            {
+                for (auto& e2 : sessEvt) if (e2) cudaEventDestroy(e2);
+                try { enc->DestroyEncoder(); } catch (...) {}
+                enc.reset();
+                freeScratch();
+                shutdownConvert(); muxer.finish(); demuxer.finish(); dec.reset();
+                if (stream) cudaStreamDestroy(stream);
+                cuCtxDestroy(cuCtx);
+                return bailout("cudaEventCreate failed");
+            }
+        }
+    }
+
     std::atomic<bool> fatal(false);
+    std::atomic<bool> cancelled(false);
     std::string       fatalMsg;
     std::mutex        fatalMx;
     auto setFatal = [&](const std::string& why)
@@ -607,61 +809,108 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     // ------------------------------------------------------------------
     std::thread tDec([&]()
     {
+        // NvDecoder reports every problem by THROWING (NVDECException) --
+        // including from GetLockedFrame/UnlockFrame, not just Decode. An
+        // exception escaping a std::thread calls std::terminate, which the
+        // user sees as a silent 0xC0000409 crash with no message. Convert
+        // everything to setFatal instead.
+        try
+        {
+
         // Attach this thread to the shared CUDA context.
         if (cuCtxSetCurrent(cuCtx) != CUDA_SUCCESS)
         {
             setFatal("decode thread: cuCtxSetCurrent failed");
-            std::lock_guard<std::mutex> g(decQ.m);
-            decQ.closed = true; decQ.cv.notify_all();
-            return;
+            throw std::runtime_error("ctx");   // -> common close below
         }
 
         std::vector<uint8_t> pipeBuf(1 << 20);
+        const bool ivfInput = demuxer.usesIvfFraming();
+        IvfStreamParser      ivf;
+        std::vector<uint8_t> ivfFrame;
         bool eof = false;
-        while (!eof && !fatal.load())
-        {
-            size_t n = demuxer.readChunk(pipeBuf.data(), pipeBuf.size());
-            int    decFlags = 0;
-            if (n == 0) { eof = true; decFlags = CUVID_PKT_ENDOFSTREAM; }
 
+        auto decodeOneChunk = [&](const uint8_t* data, int size, int flags) -> bool
+        {
+            if (!size && !(flags & CUVID_PKT_ENDOFSTREAM))
+                return true;
             int nReady = 0;
             try
             {
-                nReady = dec->Decode(pipeBuf.data(),
-                                     static_cast<int>(n), decFlags);
+                nReady = dec->Decode(data, size, flags);
             }
             catch (const std::exception& e)
             {
                 setFatal(std::string("NvDecoder::Decode threw: ") + e.what());
-                break;
+                return false;
             }
-
             for (int i = 0; i < nReady && !fatal.load(); ++i)
             {
                 DecodedFrame df;
-                // GetLockedFrame (not GetFrame!): without the lock, NvDecoder
-                // will reuse the underlying surface on the NEXT Decode() once
-                // its output queue wraps around, which silently corrupts
-                // frames that Thread B hasn't consumed yet. The symptom is a
-                // "skipped/duplicated frame" every few seconds -- exactly
-                // what the user saw. Thread B is responsible for calling
-                // dec->UnlockFrame() once all stream work that touches this
-                // pointer has completed (we defer unlock by m_nOutputDelay+1
-                // frames below, so NVENC's internal frame done is a safe
-                // upper bound on kernel completion).
-                df.devPtr = dec->GetLockedFrame();
-                df.pitch  = dec->GetDeviceFramePitch();
+                df.devPtr     = dec->GetLockedFrame();
+                df.pitch      = dec->GetDeviceFramePitch();
+                df.frameIndex = static_cast<size_t>(framesDecoded.load());
 
                 std::unique_lock<std::mutex> lk(decQ.m);
                 decQ.cv.wait(lk, [&]
                 {
                     return fatal.load() || decQ.q.size() < decQ.maxDepth;
                 });
-                if (fatal.load()) break;
+                if (fatal.load()) return false;
                 decQ.q.push_back(df);
                 ++framesDecoded;
                 decQ.cv.notify_all();
             }
+            return true;
+        };
+
+        if (ivfInput)
+        {
+            while (!eof && !fatal.load())
+            {
+                size_t n = demuxer.readChunk(pipeBuf.data(), pipeBuf.size());
+                if (n == 0)
+                {
+                    eof = true;
+                    ivf.setEof();
+                }
+                else
+                {
+                    ivf.append(pipeBuf.data(), n);
+                }
+
+                while (!fatal.load() && ivf.nextFrame(ivfFrame))
+                {
+                    if (!decodeOneChunk(ivfFrame.data(),
+                                        static_cast<int>(ivfFrame.size()), 0))
+                        break;
+                }
+            }
+            if (!fatal.load())
+                decodeOneChunk(nullptr, 0, CUVID_PKT_ENDOFSTREAM);
+        }
+        else
+        {
+            while (!eof && !fatal.load())
+            {
+                size_t n = demuxer.readChunk(pipeBuf.data(), pipeBuf.size());
+                int    decFlags = 0;
+                if (n == 0) { eof = true; decFlags = CUVID_PKT_ENDOFSTREAM; }
+
+                if (!decodeOneChunk(n ? pipeBuf.data() : nullptr,
+                                    static_cast<int>(n), decFlags))
+                    break;
+            }
+        }
+
+        }
+        catch (const std::exception& e)
+        {
+            setFatal(std::string("decode thread: ") + e.what());
+        }
+        catch (...)
+        {
+            setFatal("decode thread: unknown exception");
         }
 
         std::lock_guard<std::mutex> g(decQ.m);
@@ -674,28 +923,39 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     // ------------------------------------------------------------------
     std::thread tProc([&]()
     {
+        // Same throw-to-setFatal net as the decode thread: NvEncoder and
+        // NvDecoder helpers (GetNextInputFrame / UnlockFrame / EndEncode)
+        // throw on failure, and an escaped exception would terminate the
+        // process without a message.
+        try
+        {
+
         if (cuCtxSetCurrent(cuCtx) != CUDA_SUCCESS)
         {
             setFatal("process thread: cuCtxSetCurrent failed");
-            std::lock_guard<std::mutex> g(pktQ.m);
-            pktQ.closed = true; pktQ.cv.notify_all();
-            return;
+            throw std::runtime_error("ctx");
         }
 
         std::vector<NvEncOutputFrame> encOut;
+        std::deque<size_t> encFrameOrder;
         auto drainEncoderOutput = [&](bool isFlush)
         {
             for (auto& pkt : encOut)
             {
-                // Copy into owning buffer; NvEncoder may recycle pkt.frame.
-                PacketBytes bytes(pkt.frame.begin(), pkt.frame.end());
+                EncodedPacket ep;
+                ep.bytes.assign(pkt.frame.begin(), pkt.frame.end());
+                if (!encFrameOrder.empty())
+                {
+                    ep.frameIndex = encFrameOrder.front();
+                    encFrameOrder.pop_front();
+                }
                 std::unique_lock<std::mutex> lk(pktQ.m);
                 pktQ.cv.wait(lk, [&]
                 {
                     return fatal.load() || pktQ.q.size() < pktQ.maxDepth;
                 });
                 if (fatal.load()) return;
-                pktQ.q.emplace_back(std::move(bytes));
+                pktQ.q.emplace_back(std::move(ep));
                 pktQ.cv.notify_all();
             }
             encOut.clear();
@@ -754,7 +1014,15 @@ GpuPipelineResult runGpuOnly(const std::string& input,
             // have finished.
             lockedFrames.push_back(df.devPtr);
 
-            // 8a. Decoder surface -> RGBA8 (tightly packed) on our stream.
+            // Stripe consecutive frames across the NGX sessions: all of this
+            // frame's compute work goes on its session's stream, so frame N
+            // (session 0) and frame N+1 (session 1) overlap on the GPU. With
+            // the fallback wrapper there is one stream and this degenerates
+            // to the old serial behaviour.
+            const size_t w = df.frameIndex % static_cast<size_t>(numSessions);
+            cudaStream_t cs = sessStream[w];
+
+            // 8a. Decoder surface -> RGBA8 (tightly packed).
             //
             // Pick the kernel based on the bit depth we probed up front:
             //   8-bit  -> NvDecoder gave us NV12 (1 byte / sample)
@@ -771,21 +1039,21 @@ GpuPipelineResult runGpuOnly(const std::string& input,
             {
                 ke = kernels::launchP010ToRgba8(
                     df.devPtr, df.pitch,
-                    reinterpret_cast<void*>(rgbaIn.ptr), rgbaIn.pitch,
+                    reinterpret_cast<void*>(rgbaIn[w].ptr), rgbaIn[w].pitch,
                     static_cast<int>(inW), static_cast<int>(inH),
                     /*bt2020*/   false,
                     /*fullRange*/ false,
-                    stream);
+                    cs);
             }
             else
             {
                 ke = kernels::launchNv12ToRgba8(
                     df.devPtr, df.pitch,
-                    reinterpret_cast<void*>(rgbaIn.ptr), rgbaIn.pitch,
+                    reinterpret_cast<void*>(rgbaIn[w].ptr), rgbaIn[w].pitch,
                     static_cast<int>(inW), static_cast<int>(inH),
                     /*bt601*/ (inH <= 576),
                     /*fullRange*/ false,
-                    stream);
+                    cs);
             }
             if (ke != cudaSuccess)
             {
@@ -795,14 +1063,24 @@ GpuPipelineResult runGpuOnly(const std::string& input,
                 break;
             }
 
-            // Kernel queued on `stream`; RTX SDK below is told about the
-            // same stream at init time, so it will naturally serialise
-            // with our write above inside its own stream dependencies.
-
-            // 8b. RTX SDK (device ptrs).
-            if (!rtx.convertFrameDevicePtr(
-                    static_cast<unsigned long long>(rgbaIn.ptr),
-                    static_cast<unsigned long long>(rgbaOut.ptr),
+            // 8b. NGX inference, ordered behind the kernel on the same
+            // stream. The direct path only *enqueues* (async staging copies
+            // + NGX eval on the session stream); the fallback wrapper blocks
+            // the host on synchronous cuMemcpy2D, exactly as before.
+            if (ngxDirect)
+            {
+                if (!sessions[w]->evaluateAsync(
+                        static_cast<unsigned long long>(rgbaIn[w].ptr),
+                        static_cast<unsigned long long>(rgbaOut[w].ptr),
+                        opts.rtx))
+                {
+                    setFatal("NGX evaluate failed.");
+                    break;
+                }
+            }
+            else if (!rtx.convertFrameDevicePtr(
+                    static_cast<unsigned long long>(rgbaIn[w].ptr),
+                    static_cast<unsigned long long>(rgbaOut[w].ptr),
                     opts.rtx))
             {
                 setFatal("RTX deviceptr evaluate failed.");
@@ -817,23 +1095,36 @@ GpuPipelineResult runGpuOnly(const std::string& input,
 
             if (hdrOut)
                 ke = kernels::launchAbgr2101010ToP010(
-                    reinterpret_cast<void*>(rgbaOut.ptr), rgbaOut.pitch,
+                    reinterpret_cast<void*>(rgbaOut[w].ptr), rgbaOut[w].pitch,
                     reinterpret_cast<void*>(encY),  encPitch,
                     reinterpret_cast<void*>(encUV), encPitch,
                     static_cast<int>(outW), static_cast<int>(outH),
-                    stream);
+                    cs);
             else
                 ke = kernels::launchRgba8ToNv12(
-                    reinterpret_cast<void*>(rgbaOut.ptr), rgbaOut.pitch,
+                    reinterpret_cast<void*>(rgbaOut[w].ptr), rgbaOut[w].pitch,
                     reinterpret_cast<void*>(encY),  encPitch,
                     reinterpret_cast<void*>(encUV), encPitch,
                     static_cast<int>(outW), static_cast<int>(outH),
-                    stream);
+                    cs);
             if (ke != cudaSuccess)
             {
                 setFatal(std::string("format-convert kernel failed: ")
                          + cudaGetErrorString(ke));
                 break;
+            }
+
+            // NVENC reads its input on `stream` (SetIOCudaStreams); make it
+            // wait for this frame's session-stream work before encoding.
+            if (ngxDirect)
+            {
+                cudaEvent_t e = sessEvt[df.frameIndex % kEvtPool];
+                if (cudaEventRecord(e, cs) != cudaSuccess ||
+                    cudaStreamWaitEvent(stream, e, 0) != cudaSuccess)
+                {
+                    setFatal("cross-stream event sync failed");
+                    break;
+                }
             }
 
             // No cudaStreamSynchronize here. EncodeFrame() calls nvEncEncodePicture
@@ -846,6 +1137,7 @@ GpuPipelineResult runGpuOnly(const std::string& input,
             // of collapsing to serial ~120fps.
             try
             {
+                encFrameOrder.push_back(df.frameIndex);
                 enc->EncodeFrame(encOut);
             }
             catch (const std::exception& e)
@@ -881,10 +1173,22 @@ GpuPipelineResult runGpuOnly(const std::string& input,
         }
 
         // After EndEncode returns, every submitted frame has been encoded,
-        // which means every kernel on the stream has also completed.
+        // which means every kernel on the session streams has also completed.
         // Safe to return ALL remaining locked decoder surfaces to the pool.
         cudaStreamSynchronize(stream);
+        for (cudaStream_t s : sessStream)
+            if (s && s != stream) cudaStreamSynchronize(s);
         unlockOldFrames(/*flushAll=*/ true);
+
+        }
+        catch (const std::exception& e)
+        {
+            setFatal(std::string("process thread: ") + e.what());
+        }
+        catch (...)
+        {
+            setFatal("process thread: unknown exception");
+        }
 
         std::lock_guard<std::mutex> g(pktQ.m);
         pktQ.closed = true;
@@ -896,9 +1200,12 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     // ------------------------------------------------------------------
     std::thread tMux([&]()
     {
+        try
+        {
+
         while (!fatal.load())
         {
-            PacketBytes bytes;
+            EncodedPacket ep;
             bool havePkt = false;
             {
                 std::unique_lock<std::mutex> lk(pktQ.m);
@@ -909,7 +1216,7 @@ GpuPipelineResult runGpuOnly(const std::string& input,
                 if (fatal.load()) break;
                 if (!pktQ.q.empty())
                 {
-                    bytes = std::move(pktQ.q.front());
+                    ep = std::move(pktQ.q.front());
                     pktQ.q.pop_front();
                     pktQ.cv.notify_all();
                     havePkt = true;
@@ -920,11 +1227,21 @@ GpuPipelineResult runGpuOnly(const std::string& input,
                 }
             }
             if (!havePkt) continue;
-            if (!muxer.writeChunk(bytes.data(), bytes.size()))
+            if (!muxer.writeChunk(ep.bytes.data(), ep.bytes.size(), ep.frameIndex))
             {
                 setFatal("muxer pipe write failed (ffmpeg muxer exited?)");
                 break;
             }
+        }
+
+        }
+        catch (const std::exception& e)
+        {
+            setFatal(std::string("mux thread: ") + e.what());
+        }
+        catch (...)
+        {
+            setFatal("mux thread: unknown exception");
         }
     });
 
@@ -946,6 +1263,16 @@ GpuPipelineResult runGpuOnly(const std::string& input,
         if (fatal.load()) break;
         if (procDone && muxDone) break;
 
+        if (opts.cancelFlag && opts.cancelFlag->load())
+        {
+            cancelled.store(true);
+            setFatal("Cancelled");
+            // Wake every worker; their waits all re-check `fatal`.
+            { std::lock_guard<std::mutex> g(decQ.m); decQ.cv.notify_all(); }
+            { std::lock_guard<std::mutex> g(pktQ.m); pktQ.cv.notify_all(); }
+            break;
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         auto now = std::chrono::steady_clock::now();
@@ -964,6 +1291,17 @@ GpuPipelineResult runGpuOnly(const std::string& input,
                    static_cast<long long>(opts.input.frameCount),
                    pct, fps);
             fflush(stdout);
+            if (opts.onProgress)
+            {
+                GpuPipelineOptions::ProgressUpdate pu;
+                pu.framesDone  = enc;
+                pu.framesTotal = static_cast<uint64_t>(
+                    std::max<int64_t>(0, opts.input.frameCount));
+                pu.elapsedSec  = secs;
+                pu.fps         = fps;
+                pu.percent     = pct;
+                opts.onProgress(pu);
+            }
             tLast = now;
         }
     }
@@ -984,6 +1322,21 @@ GpuPipelineResult runGpuOnly(const std::string& input,
     result.framesOut = framesEncoded.load();
     printf("\n");
 
+    // Frames are all encoded (bar at 100%), but the audio mux + A/V verify
+    // still run below and can take a while on a large file. Signal the UI so it
+    // doesn't look frozen at 100%. Only when we're actually merging audio —
+    // video-only output finalizes near-instantly and needs no banner.
+    if (opts.onProgress && audioTwoPassMux)
+    {
+        GpuPipelineOptions::ProgressUpdate pu;
+        pu.framesDone  = framesEncoded.load();
+        pu.framesTotal = static_cast<uint64_t>(
+            std::max<int64_t>(0, opts.input.frameCount));
+        pu.percent     = 100.0;
+        pu.finalizing  = true;
+        opts.onProgress(pu);
+    }
+
     bool pumpError = fatal.load();
     if (pumpError && !fatalMsg.empty())
         fprintf(stderr, "%s\n", fatalMsg.c_str());
@@ -999,18 +1352,95 @@ GpuPipelineResult runGpuOnly(const std::string& input,
 
     try { enc->DestroyEncoder(); } catch (...) {}
     enc.reset();
-    rgbaIn.free_();
-    rgbaOut.free_();
-    rtx.shutdown();
+    for (cudaEvent_t e : sessEvt)
+        if (e) cudaEventDestroy(e);
+    freeScratch();
+    if (ngxDirect)
+    {
+        destroySessions();
+    }
+    else
+    {
+        rtx.shutdown();
+        sessStream.clear();   // held the NVENC stream; destroyed below
+    }
     muxer.finish();
     demuxer.finish();
     dec.reset();
     if (stream) cudaStreamDestroy(stream);
     cuCtxDestroy(cuCtx);
 
+    // Cancel arriving between the last frame and the audio merge: skip the
+    // merge entirely; the cleanup below removes the temp and the output.
+    if (!pumpError && opts.cancelFlag && opts.cancelFlag->load())
+    {
+        cancelled.store(true);
+        pumpError = true;
+        if (fatalMsg.empty()) fatalMsg = "Cancelled";
+    }
+
+    if (!pumpError && audioTwoPassMux)
+    {
+        // Per-frame source timestamps are usable only when the decoder kept
+        // a strict 1:1 frame mapping (IPPP output preserves display order,
+        // so output frame i corresponds to the i-th displayed source frame).
+        // The capture file is complete here: the demuxer ffmpeg has exited
+        // (demuxer.finish() above waited for it).
+        FramePtsInfo srcFramePts;
+        const FramePtsInfo* framePts = nullptr;
+        if (wantPtsPassthrough)
+        {
+            if (parseFrameCrcPts(tsCapturePath, srcFramePts) &&
+                srcFramePts.pts.size() == framesEncoded.load())
+            {
+                framePts = &srcFramePts;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "Note: VFR passthrough unavailable (%zu source "
+                        "timestamps, %llu encoded frames); using CFR "
+                        "%u/%u fps.\n",
+                        srcFramePts.pts.size(),
+                        static_cast<unsigned long long>(framesEncoded.load()),
+                        mo.fpsNum, mo.fpsDen);
+            }
+        }
+
+        printf("  mux: copying audio from source...\n");
+        if (!remuxCopyAudio(tempVideoOnly, input, output, opts.codec,
+                            mo.fpsNum, mo.fpsDen, hdrOut, opts.verbose,
+                            framePts))
+        {
+            pumpError = true;
+            if (fatalMsg.empty())
+                fatalMsg = "Failed to merge audio from source after encode";
+        }
+    }
+    if (!tempVideoOnly.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(tempVideoOnly, ec);
+    }
+    if (!tsCapturePath.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(tsCapturePath, ec);
+    }
+    // A failed two-pass merge leaves a broken output; a cancelled run leaves
+    // a truncated one (whether the muxer wrote it directly or not). Neither
+    // is playable -- remove rather than leave junk behind.
+    if (pumpError && (audioTwoPassMux || cancelled.load()))
+    {
+        std::error_code ec;
+        std::filesystem::remove(output, ec);
+    }
+
     auto tEnd = std::chrono::steady_clock::now();
     result.seconds = std::chrono::duration<double>(tEnd - tStart).count();
     result.ok = !pumpError;
+    if (pumpError && result.errorDetail.empty())
+        result.errorDetail = fatalMsg.empty() ? "pipeline error" : fatalMsg;
     return result;
 }
 

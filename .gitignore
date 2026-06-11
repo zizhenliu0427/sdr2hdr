@@ -13,6 +13,14 @@ cmake_install.cmake
 # NVIDIA Video Codec SDK 头文件与库，受 NVIDIA 许可限制，不再分发
 vendor/
 
+# ===== WinUI GUI 构建产物 =====
+gui/packages/
+gui/.vs/
+gui/x64/
+gui/out/
+.winapp/
+.winapp-tools/
+
 # ===== 二进制 / Binaries =====
 *.exe
 *.dll

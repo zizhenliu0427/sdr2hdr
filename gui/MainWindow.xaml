@@ -1,0 +1,430 @@
+<Window
+    x:Class="sdr2hdr_gui.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="sdr2hdr">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop/>
+    </Window.SystemBackdrop>
+
+    <Grid x:Name="RootShell">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Custom title bar (draggable region). Height matches the system
+             "Tall" caption-button area set in code, which centres the
+             min/max/close buttons vertically for a more polished look. -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Height="48" Background="Transparent">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Image x:Name="TitleBarIcon" Grid.Column="0" Width="20" Height="20"
+                   Margin="14,0,0,0" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="1" Text="sdr2hdr" VerticalAlignment="Center"
+                       Margin="10,0,0,0" FontSize="12"
+                       Style="{StaticResource CaptionTextBlockStyle}"/>
+        </Grid>
+
+        <NavigationView x:Name="NavView" Grid.Row="1"
+                        PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
+                        IsSettingsVisible="False"
+                        OpenPaneLength="200"
+                        SelectionChanged="OnNavSelectionChanged">
+            <NavigationView.MenuItems>
+                <NavigationViewItem x:Name="NavConvert" Content="Convert" Tag="0" IsSelected="True">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE714;"/>
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="NavCommand" Content="Command line" Tag="1">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE756;"/>
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="NavSettings" Content="Settings" Tag="2">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE713;"/>
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="NavAbout" Content="About" Tag="3">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE946;"/>
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <Grid x:Name="RootGrid" Padding="0,4,0,0">
+                <!-- ===================== Convert page ===================== -->
+                <Grid x:Name="ConvertPage" Visibility="Visible" Margin="28,12,28,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer x:Name="ConvertScroll" Grid.Row="0"
+                                  VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto"
+                                  Padding="0,0,4,0">
+                        <!-- MinHeight pinned to the viewport so the queue/preview fills the
+                             window when there's room, and the page scrolls when there isn't. -->
+                        <Grid MinHeight="{Binding ViewportHeight, ElementName=ConvertScroll}">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Grid.Row="0" Spacing="10">
+                                <TextBlock x:Name="ConvertTitle" Text="Convert" Margin="0,0,0,4"
+                                           Style="{StaticResource TitleTextBlockStyle}"/>
+                                <InfoBar x:Name="DepsInfoBar" IsOpen="False" IsClosable="False"/>
+                                <InfoBar x:Name="InputHintBar" IsOpen="False" IsClosable="True"
+                                         Severity="Warning"/>
+                            </StackPanel>
+
+                            <!-- Drop zone -->
+                            <Border Grid.Row="1" Margin="0,12,0,0" Padding="28"
+                                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="1" CornerRadius="8"
+                                    AllowDrop="True" DragOver="OnDragOver" Drop="OnDrop">
+                                <StackPanel Spacing="6" HorizontalAlignment="Center">
+                                    <FontIcon Glyph="&#xE898;" FontSize="28" HorizontalAlignment="Center"
+                                              Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
+                                    <TextBlock x:Name="DropTitle" Text="Drop video files here" FontSize="15"
+                                               HorizontalAlignment="Center" FontWeight="SemiBold"/>
+                                    <TextBlock x:Name="DropHint" Text="MP4 · MKV · MOV · WEBM · AVI" Opacity="0.55"
+                                               FontSize="12" HorizontalAlignment="Center"/>
+                                    <Button x:Name="AddFilesButton" Content="Add files…"
+                                            Margin="0,6,0,0" HorizontalAlignment="Center"
+                                            Click="OnAddFilesClick"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Output settings card -->
+                            <Border Grid.Row="2" Margin="0,12,0,0" Padding="20"
+                                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="1" CornerRadius="8">
+                                <StackPanel Spacing="16">
+                                    <StackPanel Spacing="8">
+                                        <TextBlock x:Name="ModeLabel" Text="Mode" FontWeight="SemiBold"/>
+                                        <StackPanel Orientation="Horizontal" Spacing="20">
+                                            <RadioButton x:Name="ModeHdr" Content="RTX HDR" GroupName="Mode"
+                                                         IsChecked="True" Checked="OnModeChanged"/>
+                                            <RadioButton x:Name="ModeVsr" Content="RTX VSR" GroupName="Mode"
+                                                         Checked="OnModeChanged"/>
+                                            <RadioButton x:Name="ModeVsrHdr" Content="RTX VSR + HDR" GroupName="Mode"
+                                                         Checked="OnModeChanged"/>
+                                        </StackPanel>
+                                    </StackPanel>
+
+                                    <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                        <CheckBox x:Name="OptCopyAudio" Content="Copy audio" IsChecked="True"
+                                                  MinWidth="0"/>
+                                        <FontIcon x:Name="CopyAudioInfo" Glyph="&#xE946;" FontSize="14"
+                                                  VerticalAlignment="Center"
+                                                  Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                    </StackPanel>
+
+                                    <!-- Encoder options -->
+                                    <StackPanel Orientation="Horizontal" Spacing="16">
+                                        <ComboBox x:Name="EncoderBox" Width="160" SelectedIndex="0">
+                                            <ComboBox.Header>
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <TextBlock x:Name="EncoderHeaderText" Text="Encoder"
+                                                               VerticalAlignment="Center"/>
+                                                    <FontIcon x:Name="EncoderInfo" Glyph="&#xE946;" FontSize="14"
+                                                              VerticalAlignment="Center" Margin="0,2,0,0"
+                                                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                </StackPanel>
+                                            </ComboBox.Header>
+                                            <ComboBoxItem x:Name="EncGpu" Content="GPU (NVENC)"/>
+                                            <ComboBoxItem x:Name="EncCpu" Content="CPU (Software)"/>
+                                        </ComboBox>
+                                        <ComboBox x:Name="CodecBox" Header="Codec" Width="120" SelectedIndex="0">
+                                            <ComboBoxItem Content="HEVC"/>
+                                            <ComboBoxItem Content="H.264"/>
+                                            <ComboBoxItem Content="AV1"/>
+                                        </ComboBox>
+                                        <ComboBox x:Name="QualityBox" Width="170" SelectedIndex="2"
+                                                  SelectionChanged="OnQualityChanged">
+                                            <ComboBox.Header>
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <TextBlock x:Name="QualityHeaderText" Text="Quality"
+                                                               VerticalAlignment="Center"/>
+                                                    <FontIcon x:Name="QualityInfo" Glyph="&#xE946;" FontSize="14"
+                                                              VerticalAlignment="Center" Margin="0,2,0,0"
+                                                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                </StackPanel>
+                                            </ComboBox.Header>
+                                            <ComboBoxItem x:Name="QualAuto"    Content="Auto (match source)"/>
+                                            <ComboBoxItem x:Name="QualHigh"    Content="High (q15)"/>
+                                            <ComboBoxItem x:Name="QualDefault" Content="Default (q19)"/>
+                                            <ComboBoxItem x:Name="QualCompact" Content="Compact (q22)"/>
+                                            <ComboBoxItem x:Name="QualCustom"  Content="Custom…"/>
+                                        </ComboBox>
+                                        <NumberBox x:Name="QualityCustom" Header="q (12–28)" Value="19"
+                                                   Minimum="12" Maximum="28" Width="110"
+                                                   Visibility="Collapsed"
+                                                   SpinButtonPlacementMode="Compact"/>
+                                        <!-- HDR-only -->
+                                        <ComboBox x:Name="PeakNitsBox" Width="140" SelectedIndex="2"
+                                                  SelectionChanged="OnPeakNitsChanged">
+                                            <ComboBox.Header>
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <TextBlock x:Name="PeakNitsHeaderText" Text="Peak nits"
+                                                               VerticalAlignment="Center"/>
+                                                    <FontIcon x:Name="PeakNitsInfo" Glyph="&#xE946;" FontSize="14"
+                                                              VerticalAlignment="Center" Margin="0,2,0,0"
+                                                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                </StackPanel>
+                                            </ComboBox.Header>
+                                            <ComboBoxItem x:Name="Nits400"  Content="400 nits"/>
+                                            <ComboBoxItem x:Name="Nits600"  Content="600 nits"/>
+                                            <ComboBoxItem x:Name="Nits1000" Content="1000 nits"/>
+                                            <ComboBoxItem x:Name="Nits2000" Content="2000 nits"/>
+                                            <ComboBoxItem x:Name="NitsCustom" Content="Custom…"/>
+                                        </ComboBox>
+                                        <NumberBox x:Name="PeakNitsCustom" Header="nits" Value="1000"
+                                                   Minimum="400" Maximum="2000" Width="110"
+                                                   Visibility="Collapsed"
+                                                   SpinButtonPlacementMode="Compact"/>
+                                    </StackPanel>
+
+                                    <!-- VSR-only options -->
+                                    <StackPanel Orientation="Horizontal" Spacing="16">
+                                        <ComboBox x:Name="ResolutionBox" Width="150"
+                                                  SelectedIndex="2" SelectionChanged="OnResolutionChanged">
+                                            <ComboBox.Header>
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <TextBlock x:Name="ResolutionHeaderText" Text="Output resolution"
+                                                               VerticalAlignment="Center"/>
+                                                    <FontIcon x:Name="ResolutionInfo" Glyph="&#xE946;" FontSize="14"
+                                                              VerticalAlignment="Center" Margin="0,2,0,0"
+                                                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                </StackPanel>
+                                            </ComboBox.Header>
+                                            <ComboBoxItem Content="1080p"/>
+                                            <ComboBoxItem Content="1440p"/>
+                                            <ComboBoxItem Content="4K (2160p)"/>
+                                            <ComboBoxItem Content="5K (2880p)"/>
+                                            <ComboBoxItem Content="8K (4320p)"/>
+                                            <ComboBoxItem x:Name="ResCustom" Content="Custom…"/>
+                                        </ComboBox>
+                                        <NumberBox x:Name="ResW" Header="Width" Value="3840"
+                                                   Minimum="16" Maximum="16384" Width="110"
+                                                   Visibility="Collapsed" SpinButtonPlacementMode="Compact"/>
+                                        <TextBlock x:Name="ResX" Text="×" FontSize="16"
+                                                   VerticalAlignment="Bottom" Margin="0,0,0,8"
+                                                   Visibility="Collapsed"/>
+                                        <NumberBox x:Name="ResH" Header="Height" Value="2160"
+                                                   Minimum="16" Maximum="16384" Width="110"
+                                                   Visibility="Collapsed" SpinButtonPlacementMode="Compact"/>
+                                        <ComboBox x:Name="VsrQualityBox" Width="130"
+                                                  SelectedIndex="3">
+                                            <ComboBox.Header>
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <TextBlock x:Name="VsrQualityHeaderText" Text="VSR quality"
+                                                               VerticalAlignment="Center"/>
+                                                    <FontIcon x:Name="VsrQualityInfo" Glyph="&#xE946;" FontSize="14"
+                                                              VerticalAlignment="Center" Margin="0,2,0,0"
+                                                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                </StackPanel>
+                                            </ComboBox.Header>
+                                            <ComboBoxItem x:Name="VsrQ1" Content="1 (fastest)"/>
+                                            <ComboBoxItem Content="2"/>
+                                            <ComboBoxItem Content="3"/>
+                                            <ComboBoxItem x:Name="VsrQ4" Content="4 (best)"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Queue -->
+                            <Border Grid.Row="3" Margin="0,12,0,12" MinHeight="240"
+                                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="1" CornerRadius="8">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                    </Grid.RowDefinitions>
+                                    <TextBlock x:Name="QueueLabel" Grid.Row="0" Text="Queue" FontWeight="SemiBold"
+                                               Margin="14,12,14,4"/>
+                                    <ListView x:Name="QueueList" Grid.Row="1"
+                                              SelectionMode="None"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+                    </ScrollViewer>
+
+                    <!-- Action bar: pinned to the bottom, outside the scroll region -->
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12"
+                                Margin="0,10,0,12" HorizontalAlignment="Right">
+                        <Button x:Name="ClearButton" Content="Clear queue" Click="OnClearClick"/>
+                        <Button x:Name="StartButton" Content="Start conversion"
+                                Style="{StaticResource AccentButtonStyle}" Click="OnStartClick"/>
+                    </StackPanel>
+                </Grid>
+
+                <!-- ===================== Command-line page ===================== -->
+                <ScrollViewer x:Name="CommandPage" Visibility="Collapsed" Padding="28,12,28,28">
+                    <StackPanel Spacing="14" MaxWidth="760" HorizontalAlignment="Left">
+                        <TextBlock x:Name="CmdTitle" Text="Command line"
+                                   Style="{StaticResource TitleTextBlockStyle}"/>
+                        <TextBlock x:Name="CmdDesc" TextWrapping="Wrap" Opacity="0.8"
+                                   Text="This build is also the command-line tool. Type arguments below and run them in a console — same as launching the .exe with these arguments."/>
+                        <Border Padding="20"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="8">
+                            <StackPanel Spacing="14">
+                                <TextBox x:Name="CommandInput"
+                                         Header="Arguments"
+                                         PlaceholderText="in.mp4 out.mp4 --vsr-hdr --4k --max-lum 1000"
+                                         FontFamily="Consolas"
+                                         AcceptsReturn="False"/>
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button x:Name="RunCommandButton" Content="Run in console"
+                                            Style="{StaticResource AccentButtonStyle}"
+                                            Click="OnRunCommandClick"/>
+                                    <Button x:Name="ShowHelpButton" Content="Show --help"
+                                            Click="OnShowHelpClick"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                        <InfoBar x:Name="CmdInfoBar" IsOpen="False" IsClosable="True"/>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- ===================== Settings page ===================== -->
+                <ScrollViewer x:Name="SettingsPage" Visibility="Collapsed" Padding="28,12,28,28">
+                    <StackPanel Spacing="16" MaxWidth="520" HorizontalAlignment="Left">
+                        <TextBlock x:Name="SettingsTitle" Text="Settings" Style="{StaticResource TitleTextBlockStyle}"/>
+
+                        <Border Padding="20"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="8">
+                            <StackPanel Spacing="16">
+                                <ComboBox x:Name="ThemeBox" Header="Theme" SelectedIndex="0" Width="220"
+                                          SelectionChanged="OnThemeChanged">
+                                    <ComboBoxItem x:Name="ThemeSystem" Content="Use system setting"/>
+                                    <ComboBoxItem x:Name="ThemeLight" Content="Light"/>
+                                    <ComboBoxItem x:Name="ThemeDark" Content="Dark"/>
+                                </ComboBox>
+                                <ComboBox x:Name="LangBox" Header="Language" SelectedIndex="0" Width="220"
+                                          SelectionChanged="OnLangChanged">
+                                    <ComboBoxItem x:Name="LangAuto" Content="Auto"/>
+                                    <ComboBoxItem Content="English (Britain/Australia)"/>
+                                    <ComboBoxItem Content="简体中文 (Simplified Chinese)"/>
+                                </ComboBox>
+                                <TextBox x:Name="OutputDirBox" Header="Default output directory (optional)"
+                                         PlaceholderText="Leave empty to write next to the source file"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Dependency status -->
+                        <Border Padding="20"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="8">
+                            <StackPanel Spacing="14">
+                                <TextBlock x:Name="DepsTitle" Text="Dependencies" FontWeight="SemiBold"/>
+
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <FontIcon x:Name="FfmpegStatusIcon" Grid.Column="0" Glyph="&#xE711;"
+                                              FontSize="16" VerticalAlignment="Center"/>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="ffmpeg / ffprobe"/>
+                                        <TextBlock x:Name="FfmpegStatusText" Text="" FontSize="12" Opacity="0.6"/>
+                                    </StackPanel>
+                                    <HyperlinkButton x:Name="FfmpegDownload" Grid.Column="2" Content="Download"
+                                                     NavigateUri="https://ffmpeg.org/download.html"/>
+                                </Grid>
+
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <FontIcon x:Name="NgxStatusIcon" Grid.Column="0" Glyph="&#xE711;"
+                                              FontSize="16" VerticalAlignment="Center"/>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="NVIDIA RTX Video  (nvngx_*.dll)"/>
+                                        <TextBlock x:Name="NgxStatusText" Text="" FontSize="12" Opacity="0.6"/>
+                                    </StackPanel>
+                                    <HyperlinkButton x:Name="NgxDownload" Grid.Column="2" Content="Download"
+                                                     NavigateUri="https://developer.nvidia.com/rtx-video-sdk"/>
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button x:Name="RecheckButton" Content="Re-check" Click="OnRecheckDepsClick"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- ===================== About page ===================== -->
+                <ScrollViewer x:Name="AboutPage" Visibility="Collapsed" Padding="28,12,28,28">
+                    <StackPanel Spacing="14" MaxWidth="520" HorizontalAlignment="Left">
+                        <TextBlock x:Name="AboutTitle" Text="About" Style="{StaticResource TitleTextBlockStyle}"/>
+                        <Border Padding="24"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="8">
+                            <StackPanel Spacing="10">
+                                <StackPanel Orientation="Horizontal" Spacing="14">
+                                    <Image x:Name="AboutIcon" Width="56" Height="56"
+                                           VerticalAlignment="Center"/>
+                                    <StackPanel VerticalAlignment="Center" Spacing="2">
+                                        <TextBlock Text="sdr2hdr" FontSize="22" FontWeight="Bold"/>
+                                        <TextBlock x:Name="VersionText" Text="Version 1.1.0" Opacity="0.7"/>
+                                    </StackPanel>
+                                    <HyperlinkButton x:Name="GitHubLink" Content="GitHub" VerticalAlignment="Center"
+                                                     NavigateUri="https://github.com/zizhenliu0427/sdr2hdr"/>
+                                </StackPanel>
+                                <TextBlock x:Name="AboutDesc" Text="RTX Video SDK — SDR to HDR / VSR converter"
+                                           Opacity="0.85" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="PoweredBy" Text="Powered by ffmpeg and NVIDIA RTX Video SDK."
+                                           Opacity="0.6" FontSize="12" TextWrapping="Wrap"/>
+                                <!-- Logos recoloured at runtime to match the theme (white ink on
+                                     dark, dark ink on light); the brand colours stay. -->
+                                <StackPanel Orientation="Vertical" Spacing="16" Margin="0,10,0,4"
+                                            HorizontalAlignment="Left">
+                                    <!-- Each logo sits in a Grid with a Canvas behind it that hosts a
+                                         Composition drop shadow masked to the logo's alpha (contour
+                                         shadow that hugs the icon + each glyph). Canvas doesn't clip,
+                                         so the soft edge isn't cut off. -->
+                                    <Grid HorizontalAlignment="Left">
+                                        <Canvas x:Name="FfmpegShadowHost"/>
+                                        <Image x:Name="FfmpegLogo" Height="52" Visibility="Collapsed"
+                                               HorizontalAlignment="Left"/>
+                                    </Grid>
+                                    <Grid HorizontalAlignment="Left" Margin="-6,0,0,0">
+                                        <Canvas x:Name="NvidiaShadowHost"/>
+                                        <Image x:Name="NvidiaLogo" Height="38" Visibility="Collapsed"
+                                               HorizontalAlignment="Left"/>
+                                    </Grid>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </Grid>
+        </NavigationView>
+    </Grid>
+</Window>
